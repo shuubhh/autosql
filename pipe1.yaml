@@ -19,10 +19,10 @@ parameters:
 variables:
   sqlScriptPath: '$(Pipeline.Workspace)/sql/script.sql'
   backupPath: '$(Pipeline.Workspace)/backup'
-  storageAccountName: 'sqlscriptstorage'
-  containerName: 'sql-scripts'
-  backupContainerName: 'sql-backups'
-  keyVaultName: 'sql-secrets-kv'
+  storageAccountName: 'sqlautostacc'
+  containerName: 'rawsql'
+  backupContainerName: 'backups'
+  keyVaultName: 'sql-validator-kv'
   secretName: 'sql-connection-string'
 
 resources:
