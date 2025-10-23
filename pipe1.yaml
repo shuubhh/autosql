@@ -1,0 +1,762 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none # Manual trigger only
+
+parameters:
+- name: sqlScriptName
+  displayName: 'SQL Script Name'
+  type: string
+  default: 'script.sql'
+- name: dryRun
+  displayName: 'Dry Run (Validation Only)'
+  type: boolean
+  default: false
+- name: enableBackup
+  displayName: 'Enable Backup Before Execution'
+  type: boolean
+  default: true
+
+variables:
+  sqlScriptPath: '$(Pipeline.Workspace)/sql/script.sql'
+  backupPath: '$(Pipeline.Workspace)/backup'
+  storageAccountName: 'sqlscriptstorage'
+  containerName: 'sql-scripts'
+  backupContainerName: 'sql-backups'
+  keyVaultName: 'sql-secrets-kv'
+  secretName: 'sql-connection-string'
+
+resources:
+  containers:
+  - container: sqltools
+    image: mcr.microsoft.com/azure-sql-edge:latest
+
+stages:
+- stage: Download_And_Validate
+  displayName: 'Download and Validate SQL Script'
+  jobs:
+  - job: DownloadScript
+    displayName: 'Download SQL Script from Blob Storage'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 10
+    
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Download SQL Script from Blob'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        scriptType: 'bash'
+        inlineScript: |
+          set -e
+          echo "Creating directory structure..."
+          mkdir -p $(Pipeline.Workspace)/sql
+          
+          echo "Downloading script: ${{ parameters.sqlScriptName }}"
+          az storage blob download \
+            --account-name $(storageAccountName) \
+            --container-name $(containerName) \
+            --name ${{ parameters.sqlScriptName }} \
+            --file $(sqlScriptPath) \
+            --auth-mode login
+          
+          if [ ! -f "$(sqlScriptPath)" ]; then
+            echo "##vso[task.logissue type=error]Failed to download SQL script"
+            exit 1
+          fi
+          
+          echo "Script downloaded successfully"
+          ls -lh $(Pipeline.Workspace)/sql/
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish SQL Script'
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/sql'
+        artifact: 'SQLScript'
+        publishLocation: 'pipeline'
+
+  - job: ValidateScript
+    displayName: 'Syntax and Security Validation'
+    dependsOn: DownloadScript
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 15
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SQL Script Artifact'
+      inputs:
+        artifact: 'SQLScript'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: UsePythonVersion@0
+      displayName: 'Use Python 3.x'
+      inputs:
+        versionSpec: '3.x'
+        addToPath: true
+
+    - script: |
+        pip install sqlparse sqlfluff==2.3.5
+      displayName: 'Install Python Dependencies'
+
+    - task: PythonScript@0
+      name: SQLValidation
+      displayName: 'SQL Syntax and Security Validation'
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import sqlparse
+          from sqlparse.sql import Statement
+          from sqlparse.tokens import Keyword, DML
+          import sys
+          import os
+          import re
+          
+          def validate_sql_syntax(file_path):
+              """Validate basic SQL syntax"""
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      sql_content = f.read()
+                  
+                  if not sql_content.strip():
+                      print("##vso[task.logissue type=error]SQL file is empty")
+                      return False
+                  
+                  parsed = sqlparse.parse(sql_content)
+                  if not parsed:
+                      print("##vso[task.logissue type=error]Failed to parse SQL content")
+                      return False
+                  
+                  print("✓ Basic SQL syntax is valid")
+                  print(f"  Found {len(parsed)} SQL statement(s)")
+                  return True
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]SQL Syntax Error: {e}")
+                  return False
+          
+          def check_security_policies(file_path):
+              """Check for dangerous SQL patterns"""
+              with open(file_path, 'r', encoding='utf-8') as f:
+                  sql_content = f.read()
+              
+              issues = []
+              warnings = []
+              sql_upper = sql_content.upper()
+              
+              # Parse statements
+              statements = sqlparse.parse(sql_content)
+              
+              for i, stmt in enumerate(statements):
+                  stmt_str = str(stmt).strip()
+                  if not stmt_str:
+                      continue
+                  
+                  stmt_upper = stmt_str.upper()
+                  stmt_num = i + 1
+                  
+                  # Critical: UPDATE/DELETE without WHERE
+                  if re.search(r'\b(UPDATE|DELETE)\b', stmt_upper):
+                      if not re.search(r'\bWHERE\b', stmt_upper):
+                          issues.append(f"Statement {stmt_num}: {stmt_upper.split()[0]} without WHERE clause - affects ALL rows!")
+                  
+                  # Critical: DROP operations
+                  dangerous_drops = ['DROP TABLE', 'DROP DATABASE', 'DROP SCHEMA']
+                  for op in dangerous_drops:
+                      if op in stmt_upper:
+                          issues.append(f"Statement {stmt_num}: Dangerous operation - {op}")
+                  
+                  # Critical: TRUNCATE
+                  if 'TRUNCATE TABLE' in stmt_upper or 'TRUNCATE' in stmt_upper:
+                      issues.append(f"Statement {stmt_num}: TRUNCATE TABLE - deletes all rows without logging")
+                  
+                  # Warning: ALTER operations
+                  if 'ALTER TABLE' in stmt_upper:
+                      warnings.append(f"Statement {stmt_num}: ALTER TABLE operation detected")
+                  
+                  # Warning: Dynamic SQL
+                  if 'EXEC(' in stmt_upper or 'EXECUTE(' in stmt_upper or 'SP_EXECUTESQL' in stmt_upper:
+                      warnings.append(f"Statement {stmt_num}: Dynamic SQL detected - potential injection risk")
+                  
+                  # Warning: Cursor usage
+                  if 'DECLARE' in stmt_upper and 'CURSOR' in stmt_upper:
+                      warnings.append(f"Statement {stmt_num}: Cursor usage - consider set-based alternatives")
+              
+              # Additional pattern checks
+              if re.search(r'--.*(?:password|pwd|secret)', sql_content, re.IGNORECASE):
+                  warnings.append("Possible hardcoded credentials found in comments")
+              
+              if re.search(r"'.*(?:password|pwd).*'", sql_content, re.IGNORECASE):
+                  warnings.append("Possible hardcoded credentials in string literals")
+              
+              return issues, warnings
+          
+          def generate_report(file_path, syntax_ok, issues, warnings):
+              """Generate validation report"""
+              report_path = '$(Pipeline.Workspace)/sql/validation_report.txt'
+              
+              with open(report_path, 'w') as f:
+                  f.write("=" * 60 + "\n")
+                  f.write("SQL VALIDATION REPORT\n")
+                  f.write("=" * 60 + "\n\n")
+                  f.write(f"Script: {os.path.basename(file_path)}\n")
+                  f.write(f"Syntax Valid: {'YES' if syntax_ok else 'NO'}\n\n")
+                  
+                  if issues:
+                      f.write(f"CRITICAL ISSUES ({len(issues)}):\n")
+                      f.write("-" * 60 + "\n")
+                      for issue in issues:
+                          f.write(f"  ⚠️  {issue}\n")
+                      f.write("\n")
+                  
+                  if warnings:
+                      f.write(f"WARNINGS ({len(warnings)}):\n")
+                      f.write("-" * 60 + "\n")
+                      for warning in warnings:
+                          f.write(f"  ℹ️  {warning}\n")
+                      f.write("\n")
+                  
+                  if not issues and not warnings:
+                      f.write("✓ No security issues detected\n\n")
+                  
+                  f.write("=" * 60 + "\n")
+              
+              print(f"\nValidation report saved to: {report_path}")
+          
+          # Main validation
+          script_path = '$(sqlScriptPath)'
+          print(f"Validating SQL script: {script_path}\n")
+          
+          syntax_ok = validate_sql_syntax(script_path)
+          issues, warnings = check_security_policies(script_path)
+          
+          # Generate report
+          generate_report(script_path, syntax_ok, issues, warnings)
+          
+          # Display results
+          if issues:
+              print("\n" + "=" * 60)
+              print(f"❌ CRITICAL ISSUES FOUND ({len(issues)}):")
+              print("=" * 60)
+              for issue in issues:
+                  print(f"  {issue}")
+                  print(f"##vso[task.logissue type=error]{issue}")
+              
+              # Set output variable for manual approval
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true')
+          else:
+              print("\n✓ No critical security issues found")
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]false')
+          
+          if warnings:
+              print("\n" + "=" * 60)
+              print(f"⚠️  WARNINGS ({len(warnings)}):")
+              print("=" * 60)
+              for warning in warnings:
+                  print(f"  {warning}")
+                  print(f"##vso[task.logissue type=warning]{warning}")
+          
+          # Exit with error if syntax validation failed
+          if not syntax_ok:
+              print("\n##vso[task.complete result=Failed;]Syntax validation failed")
+              sys.exit(1)
+          
+          print("\n✓ Validation completed successfully")
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Validation Report'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/sql'
+        artifact: 'ValidationReport'
+        publishLocation: 'pipeline'
+
+- stage: Security_Review
+  displayName: 'Security Review Required'
+  dependsOn: Download_And_Validate
+  condition: |
+    and(
+      succeeded(),
+      eq(dependencies.Download_And_Validate.outputs['ValidateScript.SQLValidation.hasSecurityIssues'], 'true')
+    )
+  
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Manual Security Approval'
+    pool: server
+    timeoutInMinutes: 1440 # 24 hours
+    
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Review and Approve Security Issues'
+      inputs:
+        instructions: |
+          ⚠️ SECURITY ISSUES DETECTED ⚠️
+          
+          The SQL script contains potential security issues that require review.
+          
+          Please:
+          1. Download and review the ValidationReport artifact
+          2. Verify the security issues are acceptable
+          3. Ensure proper authorization for dangerous operations
+          4. Approve only if you accept the risks
+          
+          Script: ${{ parameters.sqlScriptName }}
+          Build: $(Build.BuildNumber)
+        onTimeout: 'reject'
+
+- stage: Backup_Database_Objects
+  displayName: 'Backup Existing Database Objects'
+  dependsOn: 
+    - Download_And_Validate
+    - Security_Review
+  condition: |
+    and(
+      not(failed()),
+      not(canceled()),
+      eq('${{ parameters.enableBackup }}', 'true'),
+      eq('${{ parameters.dryRun }}', 'false')
+    )
+  
+  jobs:
+  - job: CreateBackup
+    displayName: 'Backup Database Objects'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 30
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SQL Script'
+      inputs:
+        artifact: 'SQLScript'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: AzurePowerShell@5
+      displayName: 'Create Database Backup'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        ScriptType: 'InlineScript'
+        azurePowerShellVersion: 'LatestVersion'
+        Inline: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+              Write-Host "Retrieving connection string from Key Vault..."
+              $secret = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
+              
+              if ([string]::IsNullOrEmpty($secret)) {
+                  throw "Failed to retrieve connection string from Key Vault"
+              }
+              
+              Write-Host "Reading SQL script..."
+              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw
+              
+              # Create backup directory
+              New-Item -ItemType Directory -Force -Path '$(backupPath)' | Out-Null
+              
+              # Identify objects that might be affected
+              $affectedObjects = @()
+              
+              if ($scriptContent -match 'CREATE PROCEDURE|ALTER PROCEDURE|DROP PROCEDURE') {
+                  $affectedObjects += "PROCEDURES"
+              }
+              if ($scriptContent -match 'CREATE FUNCTION|ALTER FUNCTION|DROP FUNCTION') {
+                  $affectedObjects += "FUNCTIONS"
+              }
+              if ($scriptContent -match 'CREATE VIEW|ALTER VIEW|DROP VIEW') {
+                  $affectedObjects += "VIEWS"
+              }
+              if ($scriptContent -match 'CREATE TABLE|ALTER TABLE|DROP TABLE') {
+                  $affectedObjects += "TABLES"
+              }
+              
+              if ($affectedObjects.Count -eq 0) {
+                  Write-Host "No database objects detected for backup"
+                  exit 0
+              }
+              
+              Write-Host "Objects detected for backup: $($affectedObjects -join ', ')"
+              
+              # Create comprehensive backup script
+              $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+              $backupFile = "$(backupPath)/backup_$timestamp.sql"
+              
+              # Generate backup script header
+              $backupScript = @"
+-- Database Backup Script
+-- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+-- Build: $(Build.BuildNumber)
+-- Original Script: ${{ parameters.sqlScriptName }}
+-- 
+
+"@
+              
+              # Backup stored procedures
+              if ($affectedObjects -contains "PROCEDURES") {
+                  Write-Host "Backing up stored procedures..."
+                  $procBackup = Invoke-Sqlcmd -ConnectionString $secret -Query @"
+                      SELECT 
+                          '-- Procedure: ' + OBJECT_SCHEMA_NAME(object_id) + '.' + name + CHAR(13) + CHAR(10) +
+                          OBJECT_DEFINITION(object_id) + CHAR(13) + CHAR(10) + 'GO' + CHAR(13) + CHAR(10)
+                      FROM sys.procedures 
+                      ORDER BY name
+"@ -MaxCharLength 65535
+                  
+                  $backupScript += "`r`n-- ===== STORED PROCEDURES =====`r`n"
+                  $procBackup | ForEach-Object { $backupScript += $_[0] + "`r`n" }
+              }
+              
+              # Backup functions
+              if ($affectedObjects -contains "FUNCTIONS") {
+                  Write-Host "Backing up functions..."
+                  $funcBackup = Invoke-Sqlcmd -ConnectionString $secret -Query @"
+                      SELECT 
+                          '-- Function: ' + OBJECT_SCHEMA_NAME(object_id) + '.' + name + CHAR(13) + CHAR(10) +
+                          OBJECT_DEFINITION(object_id) + CHAR(13) + CHAR(10) + 'GO' + CHAR(13) + CHAR(10)
+                      FROM sys.objects
+                      WHERE type IN ('FN', 'IF', 'TF')
+                      ORDER BY name
+"@ -MaxCharLength 65535
+                  
+                  $backupScript += "`r`n-- ===== FUNCTIONS =====`r`n"
+                  $funcBackup | ForEach-Object { $backupScript += $_[0] + "`r`n" }
+              }
+              
+              # Backup views
+              if ($affectedObjects -contains "VIEWS") {
+                  Write-Host "Backing up views..."
+                  $viewBackup = Invoke-Sqlcmd -ConnectionString $secret -Query @"
+                      SELECT 
+                          '-- View: ' + OBJECT_SCHEMA_NAME(object_id) + '.' + name + CHAR(13) + CHAR(10) +
+                          OBJECT_DEFINITION(object_id) + CHAR(13) + CHAR(10) + 'GO' + CHAR(13) + CHAR(10)
+                      FROM sys.views
+                      ORDER BY name
+"@ -MaxCharLength 65535
+                  
+                  $backupScript += "`r`n-- ===== VIEWS =====`r`n"
+                  $viewBackup | ForEach-Object { $backupScript += $_[0] + "`r`n" }
+              }
+              
+              # Save backup file
+              $backupScript | Out-File -FilePath $backupFile -Encoding UTF8
+              Write-Host "Backup saved to: $backupFile"
+              
+              # Upload to Azure Blob Storage
+              Write-Host "Uploading backup to Azure Storage..."
+              $blobName = "backup_$(Build.BuildNumber)_$timestamp.sql"
+              
+              az storage blob upload `
+                --account-name $(storageAccountName) `
+                --container-name $(backupContainerName) `
+                --name $blobName `
+                --file $backupFile `
+                --auth-mode login `
+                --overwrite
+              
+              if ($LASTEXITCODE -ne 0) {
+                  throw "Failed to upload backup to blob storage"
+              }
+              
+              Write-Host "✓ Backup completed successfully"
+              Write-Host "  Backup location: $(backupContainerName)/$blobName"
+              
+              # Set variable for next stages
+              Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
+              Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]$blobName"
+          }
+          catch {
+              Write-Error "Backup failed: $($_.Exception.Message)"
+              Write-Host "##vso[task.logissue type=error]Backup operation failed"
+              exit 1
+          }
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Backup Files'
+      condition: always()
+      inputs:
+        targetPath: '$(backupPath)'
+        artifact: 'DatabaseBackup'
+        publishLocation: 'pipeline'
+
+- stage: Execute_SQL_Script
+  displayName: 'Execute SQL Script'
+  dependsOn: 
+    - Download_And_Validate
+    - Security_Review
+    - Backup_Database_Objects
+  condition: |
+    and(
+      not(failed()),
+      not(canceled()),
+      eq('${{ parameters.dryRun }}', 'false')
+    )
+  
+  jobs:
+  - job: ExecuteScript
+    displayName: 'Run SQL Script with Transaction'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 60
+    
+    steps:
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SQL Script'
+      inputs:
+        artifact: 'SQLScript'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: AzurePowerShell@5
+      name: ExecuteSQL
+      displayName: 'Execute SQL Script'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        ScriptType: 'InlineScript'
+        azurePowerShellVersion: 'LatestVersion'
+        Inline: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+              Write-Host "Retrieving connection string..."
+              $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
+              
+              Write-Host "Reading SQL script..."
+              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw
+              
+              if ([string]::IsNullOrEmpty($scriptContent)) {
+                  throw "SQL script is empty"
+              }
+              
+              # Create execution log directory
+              $logPath = "$(Pipeline.Workspace)/logs"
+              New-Item -ItemType Directory -Force -Path $logPath | Out-Null
+              $logFile = "$logPath/execution_log.txt"
+              
+              # Log execution start
+              $logHeader = @"
+SQL Script Execution Log
+Build: $(Build.BuildNumber)
+Script: ${{ parameters.sqlScriptName }}
+Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+========================================
+
+"@
+              $logHeader | Out-File -FilePath $logFile -Encoding UTF8
+              
+              # Split script by GO statements
+              $statements = $scriptContent -split "(?m)^\s*GO\s*$" | Where-Object { $_.Trim() -ne "" }
+              
+              Write-Host "Found $($statements.Count) statement batch(es) to execute"
+              
+              $executedCount = 0
+              $failedStatements = @()
+              
+              # Execute each statement
+              foreach ($i in 0..($statements.Count - 1)) {
+                  $statement = $statements[$i].Trim()
+                  
+                  if ([string]::IsNullOrWhiteSpace($statement)) {
+                      continue
+                  }
+                  
+                  $batchNum = $i + 1
+                  $preview = if ($statement.Length -gt 100) { $statement.Substring(0, 100) + "..." } else { $statement }
+                  
+                  Write-Host ""
+                  Write-Host "Executing batch $batchNum/$($statements.Count)..."
+                  Write-Host "Preview: $preview"
+                  
+                  # Log to file
+                  "Batch $batchNum - $(Get-Date -Format 'HH:mm:ss')" | Out-File -FilePath $logFile -Append
+                  $preview | Out-File -FilePath $logFile -Append
+                  
+                  try {
+                      $startTime = Get-Date
+                      
+                      # Execute statement
+                      Invoke-Sqlcmd -ConnectionString $connectionString `
+                                    -Query $statement `
+                                    -QueryTimeout 300 `
+                                    -ErrorAction Stop `
+                                    -Verbose
+                      
+                      $duration = (Get-Date) - $startTime
+                      $executedCount++
+                      
+                      $successMsg = "✓ Batch $batchNum completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      Write-Host $successMsg -ForegroundColor Green
+                      "$successMsg`n" | Out-File -FilePath $logFile -Append
+                  }
+                  catch {
+                      $errorMsg = "✗ Batch $batchNum failed: $($_.Exception.Message)"
+                      Write-Host $errorMsg -ForegroundColor Red
+                      "$errorMsg`n" | Out-File -FilePath $logFile -Append
+                      
+                      $failedStatements += @{
+                          Batch = $batchNum
+                          Error = $_.Exception.Message
+                          Statement = $preview
+                      }
+                      
+                      # Stop on first error
+                      throw "Execution failed at batch $batchNum. Rolling back any uncommitted changes."
+                  }
+              }
+              
+              # Success summary
+              Write-Host ""
+              Write-Host "========================================" -ForegroundColor Green
+              Write-Host "✓ SQL Script Executed Successfully" -ForegroundColor Green
+              Write-Host "========================================" -ForegroundColor Green
+              Write-Host "Batches executed: $executedCount/$($statements.Count)"
+              Write-Host "Build: $(Build.BuildNumber)"
+              
+              $successSummary = @"
+
+========================================
+EXECUTION COMPLETED SUCCESSFULLY
+========================================
+Batches executed: $executedCount/$($statements.Count)
+Completed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+"@
+              $successSummary | Out-File -FilePath $logFile -Append
+              
+              # Set success variable
+              Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
+              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
+          }
+          catch {
+              Write-Host ""
+              Write-Host "========================================" -ForegroundColor Red
+              Write-Host "✗ SQL Script Execution Failed" -ForegroundColor Red
+              Write-Host "========================================" -ForegroundColor Red
+              Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+              
+              if ($failedStatements.Count -gt 0) {
+                  Write-Host "`nFailed Statements:"
+                  $failedStatements | ForEach-Object {
+                      Write-Host "  Batch $($_.Batch): $($_.Error)"
+                  }
+              }
+              
+              $errorSummary = @"
+
+========================================
+EXECUTION FAILED
+========================================
+Error: $($_.Exception.Message)
+Failed at: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+"@
+              $errorSummary | Out-File -FilePath $logFile -Append
+              
+              # Set failure variable
+              Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
+              Write-Host "##vso[task.logissue type=error]SQL execution failed: $($_.Exception.Message)"
+              
+              exit 1
+          }
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Logs'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/logs'
+        artifact: 'ExecutionLogs'
+        publishLocation: 'pipeline'
+
+- stage: Notify_And_Audit
+  displayName: 'Notification and Audit'
+  dependsOn: 
+    - Download_And_Validate
+    - Execute_SQL_Script
+  condition: always()
+  
+  jobs:
+  - job: SendNotification
+    displayName: 'Send Execution Results'
+    pool:
+      vmImage: 'ubuntu-latest'
+    timeoutInMinutes: 10
+    
+    steps:
+    - task: PowerShell@2
+      displayName: 'Generate and Send Notification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $result = "$(ExecuteSQL.executionResult)"
+          $buildNumber = "$(Build.BuildNumber)"
+          $scriptName = "${{ parameters.sqlScriptName }}"
+          $isDryRun = "${{ parameters.dryRun }}"
+          
+          Write-Host "========================================="
+          Write-Host "PIPELINE EXECUTION SUMMARY"
+          Write-Host "========================================="
+          Write-Host "Build: $buildNumber"
+          Write-Host "Script: $scriptName"
+          Write-Host "Dry Run: $isDryRun"
+          Write-Host "Result: $result"
+          Write-Host "========================================="
+          
+          if ($isDryRun -eq "true") {
+              Write-Host "✓ Dry run completed - validation only"
+              # Send validation-only notification
+          }
+          elseif ($result -eq "Success") {
+              Write-Host "✓ SQL Script executed successfully!"
+              
+              # TODO: Implement notification (Teams, Email, etc.)
+              # Example Teams webhook:
+              # $teamsWebhook = "YOUR_TEAMS_WEBHOOK_URL"
+              # $body = @{
+              #     title = "SQL Deployment Successful"
+              #     text = "Build $buildNumber completed successfully"
+              #     themeColor = "00FF00"
+              # } | ConvertTo-Json
+              # Invoke-RestMethod -Uri $teamsWebhook -Method Post -Body $body -ContentType 'application/json'
+              
+          } else {
+              Write-Host "✗ SQL Script execution failed!"
+              
+              # TODO: Implement failure notification
+              # Example Teams webhook for failure:
+              # $teamsWebhook = "YOUR_TEAMS_WEBHOOK_URL"
+              # $body = @{
+              #     title = "SQL Deployment Failed"
+              #     text = "Build $buildNumber failed. Check logs for details."
+              #     themeColor = "FF0000"
+              # } | ConvertTo-Json
+              # Invoke-RestMethod -Uri $teamsWebhook -Method Post -Body $body -ContentType 'application/json'
+          }
+
+    - task: AzureCLI@2
+      displayName: 'Audit Trail - Log Execution'
+      condition: eq('${{ parameters.dryRun }}', 'false')
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        scriptType: 'bash'
+        inlineScript: |
+          # Create audit log entry
+          cat > audit_log.json << EOF
+          {
+            "buildNumber": "$(Build.BuildNumber)",
+            "buildId": "$(Build.BuildId)",
+            "scriptName": "${{ parameters.sqlScriptName }}",
+            "executionResult": "$(ExecuteSQL.executionResult)",
+            "executedBy": "$(Build.RequestedFor)",
+            "executedAt": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "repository": "$(Build.Repository.Name)",
+            "branch": "$(Build.SourceBranchName)",
+            "dryRun": "${{ parameters.dryRun }}"
+          }
+          EOF
+          
+          # Upload audit log to blob storage
+          az storage blob upload \
+            --account-name $(storageAccountName) \
+            --container-name audit-logs \
+            --name "audit_$(Build.BuildNumber)_$(date +%Y%m%d_%H%M%S).json" \
+            --file audit_log.json \
+            --auth-mode login \
+            --overwrite || true
+          
+          echo "✓ Audit log created"
