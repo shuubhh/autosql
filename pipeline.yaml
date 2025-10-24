@@ -18,7 +18,7 @@ parameters:
 - name: agentPool
   displayName: 'Agent Pool'
   type: string
-  default: 'self1'  # Change to your self-hosted pool name
+  default: 'self1'
 
 variables:
   sqlScriptPath: '$(Pipeline.Workspace)/sql/script.sql'
@@ -41,7 +41,7 @@ stages:
     timeoutInMinutes: 10
     
     steps:
-    - checkout: none  # Don't need source code
+    - checkout: none
     
     - task: PowerShell@2
       displayName: 'Verify Agent Prerequisites'
@@ -169,14 +169,12 @@ stages:
         scriptSource: 'inline'
         script: |
           import sqlparse
-          from sqlparse.sql import Statement
-          from sqlparse.tokens import Keyword, DML
           import sys
           import os
           import re
+          import json
           
           def validate_sql_syntax(file_path):
-              """Validate basic SQL syntax"""
               try:
                   with open(file_path, 'r', encoding='utf-8') as f:
                       sql_content = f.read()
@@ -198,15 +196,12 @@ stages:
                   return False
           
           def check_security_policies(file_path):
-              """Check for dangerous SQL patterns"""
               with open(file_path, 'r', encoding='utf-8') as f:
                   sql_content = f.read()
               
               issues = []
               warnings = []
-              sql_upper = sql_content.upper()
               
-              # Parse statements
               statements = sqlparse.parse(sql_content)
               
               for i, stmt in enumerate(statements):
@@ -217,58 +212,27 @@ stages:
                   stmt_upper = stmt_str.upper()
                   stmt_num = i + 1
                   
-                  # Critical: UPDATE/DELETE without WHERE
                   if re.search(r'\b(UPDATE|DELETE)\b', stmt_upper):
-                      # Check if WHERE exists (excluding subqueries and CTEs)
                       if not re.search(r'\bWHERE\b', stmt_upper):
-                          issues.append(f"Statement {stmt_num}: {stmt_upper.split()[0]} without WHERE clause - affects ALL rows!")
+                          issues.append(f"Statement {stmt_num}: {stmt_upper.split()[0]} without WHERE clause")
                   
-                  # Critical: DROP operations
                   dangerous_drops = ['DROP TABLE', 'DROP DATABASE', 'DROP SCHEMA']
                   for op in dangerous_drops:
                       if op in stmt_upper:
                           issues.append(f"Statement {stmt_num}: Dangerous operation - {op}")
                   
-                  # Critical: TRUNCATE
                   if 'TRUNCATE TABLE' in stmt_upper or re.search(r'\bTRUNCATE\s+TABLE\b', stmt_upper):
-                      issues.append(f"Statement {stmt_num}: TRUNCATE TABLE - deletes all rows without logging")
+                      issues.append(f"Statement {stmt_num}: TRUNCATE TABLE detected")
                   
-                  # Warning: ALTER operations
                   if 'ALTER TABLE' in stmt_upper:
-                      warnings.append(f"Statement {stmt_num}: ALTER TABLE operation detected")
+                      warnings.append(f"Statement {stmt_num}: ALTER TABLE operation")
                   
-                  # Warning: Dynamic SQL
                   if re.search(r'\bEXEC\s*\(|\bEXECUTE\s*\(|\bSP_EXECUTESQL\b', stmt_upper):
-                      warnings.append(f"Statement {stmt_num}: Dynamic SQL detected - potential injection risk")
-                  
-                  # Warning: Cursor usage
-                  if 'DECLARE' in stmt_upper and 'CURSOR' in stmt_upper:
-                      warnings.append(f"Statement {stmt_num}: Cursor usage - consider set-based alternatives")
-                  
-                  # Warning: SELECT * usage
-                  if re.search(r'\bSELECT\s+\*\s+FROM\b', stmt_upper):
-                      warnings.append(f"Statement {stmt_num}: SELECT * usage - specify columns explicitly for better performance")
-                  
-                  # Warning: Missing NOCOUNT
-                  if re.search(r'\b(CREATE|ALTER)\s+PROCEDURE\b', stmt_upper):
-                      if 'SET NOCOUNT ON' not in stmt_upper:
-                          warnings.append(f"Statement {stmt_num}: Procedure without SET NOCOUNT ON")
-              
-              # Additional pattern checks
-              if re.search(r'--.*(?:password|pwd|secret|key)', sql_content, re.IGNORECASE):
-                  warnings.append("Possible hardcoded credentials found in comments")
-              
-              if re.search(r"'[^']*(?:password|pwd)[^']*'", sql_content, re.IGNORECASE):
-                  warnings.append("Possible hardcoded credentials in string literals")
-              
-              # Check for SQL injection patterns
-              if re.search(r"'\s*\+\s*@|\+\s*'", sql_content):
-                  warnings.append("Potential SQL injection: String concatenation with variables detected")
+                      warnings.append(f"Statement {stmt_num}: Dynamic SQL detected")
               
               return issues, warnings
           
           def extract_affected_objects(file_path):
-              """Extract names of procedures/functions/views being modified"""
               with open(file_path, 'r', encoding='utf-8') as f:
                   sql_content = f.read()
               
@@ -279,37 +243,32 @@ stages:
                   'tables': []
               }
               
-              # Extract procedure names
               proc_pattern = r'(?:CREATE|ALTER|DROP)\s+PROCEDURE\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?'
               affected['procedures'] = re.findall(proc_pattern, sql_content, re.IGNORECASE)
               
-              # Extract function names
               func_pattern = r'(?:CREATE|ALTER|DROP)\s+FUNCTION\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?'
               affected['functions'] = re.findall(func_pattern, sql_content, re.IGNORECASE)
               
-              # Extract view names
               view_pattern = r'(?:CREATE|ALTER|DROP)\s+VIEW\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?'
               affected['views'] = re.findall(view_pattern, sql_content, re.IGNORECASE)
               
-              # Extract table names
               table_pattern = r'(?:CREATE|ALTER|DROP)\s+TABLE\s+(?:\[?[\w]+\]?\.)?\[?([\w]+)\]?'
               affected['tables'] = re.findall(table_pattern, sql_content, re.IGNORECASE)
               
               return affected
           
           def generate_report(file_path, syntax_ok, issues, warnings, affected):
-              """Generate validation report"""
-              report_path = '$(Pipeline.Workspace)/sql/validation_report.txt'
+              report_dir = '$(Pipeline.Workspace)/sql'
+              os.makedirs(report_dir, exist_ok=True)
+              report_path = os.path.join(report_dir, 'validation_report.txt')
               
               with open(report_path, 'w') as f:
                   f.write("=" * 70 + "\n")
                   f.write("SQL VALIDATION REPORT\n")
                   f.write("=" * 70 + "\n\n")
                   f.write(f"Script: {os.path.basename(file_path)}\n")
-                  f.write(f"Build: $(Build.BuildNumber)\n")
                   f.write(f"Syntax Valid: {'YES' if syntax_ok else 'NO'}\n\n")
                   
-                  # Affected objects
                   if any(affected.values()):
                       f.write("AFFECTED DATABASE OBJECTS:\n")
                       f.write("-" * 70 + "\n")
@@ -342,15 +301,10 @@ stages:
                   
                   f.write("=" * 70 + "\n")
               
-              print(f"\nValidation report saved to: {report_path}")
-              
-              # Also save affected objects as JSON for backup stage
-              import json
-              affected_path = '$(Pipeline.Workspace)/sql/affected_objects.json'
+              affected_path = os.path.join(report_dir, 'affected_objects.json')
               with open(affected_path, 'w') as f:
                   json.dump(affected, f, indent=2)
           
-          # Main validation
           script_path = '$(sqlScriptPath)'
           print(f"Validating SQL script: {script_path}\n")
           
@@ -358,10 +312,8 @@ stages:
           issues, warnings = check_security_policies(script_path)
           affected = extract_affected_objects(script_path)
           
-          # Generate report
           generate_report(script_path, syntax_ok, issues, warnings, affected)
           
-          # Display results
           if issues:
               print("\n" + "=" * 70)
               print(f"❌ CRITICAL ISSUES FOUND ({len(issues)}):")
@@ -369,8 +321,6 @@ stages:
               for issue in issues:
                   print(f"  {issue}")
                   print(f"##vso[task.logissue type=error]{issue}")
-              
-              # Set output variable for manual approval
               print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true')
           else:
               print("\n✓ No critical security issues found")
@@ -384,21 +334,6 @@ stages:
                   print(f"  {warning}")
                   print(f"##vso[task.logissue type=warning]{warning}")
           
-          # Display affected objects
-          if any(affected.values()):
-              print("\n" + "=" * 70)
-              print("AFFECTED DATABASE OBJECTS:")
-              print("=" * 70)
-              if affected['procedures']:
-                  print(f"  Procedures: {', '.join(set(affected['procedures']))}")
-              if affected['functions']:
-                  print(f"  Functions: {', '.join(set(affected['functions']))}")
-              if affected['views']:
-                  print(f"  Views: {', '.join(set(affected['views']))}")
-              if affected['tables']:
-                  print(f"  Tables: {', '.join(set(affected['tables']))}")
-          
-          # Exit with error if syntax validation failed
           if not syntax_ok:
               print("\n##vso[task.complete result=Failed;]Syntax validation failed")
               sys.exit(1)
@@ -426,7 +361,7 @@ stages:
   - job: WaitForApproval
     displayName: 'Manual Security Approval'
     pool: server
-    timeoutInMinutes: 1440 # 24 hours
+    timeoutInMinutes: 1440
     
     steps:
     - task: ManualValidation@0
@@ -500,68 +435,47 @@ stages:
               if (Test-Path $affectedObjectsPath) {
                   $affectedObjects = Get-Content $affectedObjectsPath | ConvertFrom-Json
               } else {
-                  Write-Host "No affected objects file found - analyzing script..."
-                  $scriptContent = Get-Content -Path '$(Pipeline.Workspace)/sql/script.sql' -Raw
-                  
-                  # Create affected objects structure
+                  Write-Host "No affected objects file found"
                   $affectedObjects = @{
                       procedures = @()
                       functions = @()
                       views = @()
                       tables = @()
                   }
-                  
-                  if ($scriptContent -match 'CREATE PROCEDURE|ALTER PROCEDURE|DROP PROCEDURE') {
-                      $affectedObjects.procedures = @('*')  # Backup all if we can't determine specific ones
-                  }
-                  if ($scriptContent -match 'CREATE FUNCTION|ALTER FUNCTION|DROP FUNCTION') {
-                      $affectedObjects.functions = @('*')
-                  }
-                  if ($scriptContent -match 'CREATE VIEW|ALTER VIEW|DROP VIEW') {
-                      $affectedObjects.views = @('*')
-                  }
               }
               
-              # Create backup directory
               New-Item -ItemType Directory -Force -Path '$(backupPath)' | Out-Null
               
               $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
               $backupFile = "$(backupPath)/backup_$timestamp.sql"
               
-              # Generate backup script header
               $backupScript = @"
--- ============================================================
--- DATABASE BACKUP SCRIPT (USER OBJECTS ONLY)
--- ============================================================
--- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
--- Build: $(Build.BuildNumber)
--- Original Script: ${{ parameters.sqlScriptName }}
--- ============================================================
-
-"@
+          -- ============================================================
+          -- DATABASE BACKUP SCRIPT (USER OBJECTS ONLY)
+          -- ============================================================
+          -- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          -- Build: $(Build.BuildNumber)
+          -- Original Script: ${{ parameters.sqlScriptName }}
+          -- ============================================================
+          
+          "@
               
               $objectsBackedUp = 0
               
-              # Backup stored procedures (USER OBJECTS ONLY)
+              # Backup stored procedures
               if ($affectedObjects.procedures -and $affectedObjects.procedures.Count -gt 0) {
                   Write-Host "Backing up user-created stored procedures..."
                   
                   $procQuery = @"
-SELECT 
-    OBJECT_SCHEMA_NAME(object_id) as SchemaName,
-    name as ObjectName,
-    OBJECT_DEFINITION(object_id) as Definition
-FROM sys.procedures
-WHERE is_ms_shipped = 0  -- Exclude system objects
-  AND name NOT LIKE 'sp[_]%'  -- Exclude system stored procedures
-  AND name NOT LIKE 'dt[_]%'  -- Exclude diagram procedures
-"@
-                  
-                  # Add specific object filter if we know which ones are affected
-                  if ($affectedObjects.procedures[0] -ne '*') {
-                      $procList = ($affectedObjects.procedures | ForEach-Object { "'$_'" }) -join ','
-                      $procQuery += "`n  AND name IN ($procList)"
-                  }
+          SELECT 
+              OBJECT_SCHEMA_NAME(object_id) as SchemaName,
+              name as ObjectName,
+              OBJECT_DEFINITION(object_id) as Definition
+          FROM sys.procedures
+          WHERE is_ms_shipped = 0
+            AND name NOT LIKE 'sp[_]%'
+            AND name NOT LIKE 'dt[_]%'
+          "@
                   
                   try {
                       $procedures = Invoke-Sqlcmd -ConnectionString $connectionString -Query $procQuery -MaxCharLength 65535 -ErrorAction Stop
@@ -576,19 +490,12 @@ WHERE is_ms_shipped = 0  -- Exclude system objects
                               Write-Host "  Backing up procedure: $fullName"
                               
                               $backupScript += "-- Procedure: $fullName`r`n"
-                              $backupScript += "-- Backed up: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
-                              
                               if ($proc.Definition) {
                                   $backupScript += $proc.Definition + "`r`n"
-                              } else {
-                                  $backupScript += "-- ERROR: Could not retrieve definition`r`n"
                               }
-                              
                               $backupScript += "GO`r`n`r`n"
                               $objectsBackedUp++
                           }
-                      } else {
-                          Write-Host "  No user procedures found to backup"
                       }
                   }
                   catch {
@@ -596,25 +503,19 @@ WHERE is_ms_shipped = 0  -- Exclude system objects
                   }
               }
               
-              # Backup functions (USER OBJECTS ONLY)
+              # Backup functions
               if ($affectedObjects.functions -and $affectedObjects.functions.Count -gt 0) {
                   Write-Host "Backing up user-created functions..."
                   
                   $funcQuery = @"
-SELECT 
-    OBJECT_SCHEMA_NAME(object_id) as SchemaName,
-    name as ObjectName,
-    OBJECT_DEFINITION(object_id) as Definition
-FROM sys.objects
-WHERE type IN ('FN', 'IF', 'TF')  -- Scalar, Inline Table-Valued, Table-Valued
-  AND is_ms_shipped = 0  -- Exclude system objects
-  AND name NOT LIKE 'fn[_]%'  -- Exclude system functions
-"@
-                  
-                  if ($affectedObjects.functions[0] -ne '*') {
-                      $funcList = ($affectedObjects.functions | ForEach-Object { "'$_'" }) -join ','
-                      $funcQuery += "`n  AND name IN ($funcList)"
-                  }
+          SELECT 
+              OBJECT_SCHEMA_NAME(object_id) as SchemaName,
+              name as ObjectName,
+              OBJECT_DEFINITION(object_id) as Definition
+          FROM sys.objects
+          WHERE type IN ('FN', 'IF', 'TF')
+            AND is_ms_shipped = 0
+          "@
                   
                   try {
                       $functions = Invoke-Sqlcmd -ConnectionString $connectionString -Query $funcQuery -MaxCharLength 65535 -ErrorAction Stop
@@ -629,19 +530,12 @@ WHERE type IN ('FN', 'IF', 'TF')  -- Scalar, Inline Table-Valued, Table-Valued
                               Write-Host "  Backing up function: $fullName"
                               
                               $backupScript += "-- Function: $fullName`r`n"
-                              $backupScript += "-- Backed up: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
-                              
                               if ($func.Definition) {
                                   $backupScript += $func.Definition + "`r`n"
-                              } else {
-                                  $backupScript += "-- ERROR: Could not retrieve definition`r`n"
                               }
-                              
                               $backupScript += "GO`r`n`r`n"
                               $objectsBackedUp++
                           }
-                      } else {
-                          Write-Host "  No user functions found to backup"
                       }
                   }
                   catch {
@@ -649,24 +543,19 @@ WHERE type IN ('FN', 'IF', 'TF')  -- Scalar, Inline Table-Valued, Table-Valued
                   }
               }
               
-              # Backup views (USER OBJECTS ONLY)
+              # Backup views
               if ($affectedObjects.views -and $affectedObjects.views.Count -gt 0) {
                   Write-Host "Backing up user-created views..."
                   
                   $viewQuery = @"
-SELECT 
-    OBJECT_SCHEMA_NAME(object_id) as SchemaName,
-    name as ObjectName,
-    OBJECT_DEFINITION(object_id) as Definition
-FROM sys.views
-WHERE is_ms_shipped = 0  -- Exclude system objects
-  AND name NOT LIKE 'sys%'  -- Exclude system views
-"@
-                  
-                  if ($affectedObjects.views[0] -ne '*') {
-                      $viewList = ($affectedObjects.views | ForEach-Object { "'$_'" }) -join ','
-                      $viewQuery += "`n  AND name IN ($viewList)"
-                  }
+          SELECT 
+              OBJECT_SCHEMA_NAME(object_id) as SchemaName,
+              name as ObjectName,
+              OBJECT_DEFINITION(object_id) as Definition
+          FROM sys.views
+          WHERE is_ms_shipped = 0
+            AND name NOT LIKE 'sys%'
+          "@
                   
                   try {
                       $views = Invoke-Sqlcmd -ConnectionString $connectionString -Query $viewQuery -MaxCharLength 65535 -ErrorAction Stop
@@ -681,19 +570,12 @@ WHERE is_ms_shipped = 0  -- Exclude system objects
                               Write-Host "  Backing up view: $fullName"
                               
                               $backupScript += "-- View: $fullName`r`n"
-                              $backupScript += "-- Backed up: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
-                              
                               if ($view.Definition) {
                                   $backupScript += $view.Definition + "`r`n"
-                              } else {
-                                  $backupScript += "-- ERROR: Could not retrieve definition`r`n"
                               }
-                              
                               $backupScript += "GO`r`n`r`n"
                               $objectsBackedUp++
                           }
-                      } else {
-                          Write-Host "  No user views found to backup"
                       }
                   }
                   catch {
@@ -701,74 +583,6 @@ WHERE is_ms_shipped = 0  -- Exclude system objects
                   }
               }
               
-              # Backup table schemas (not data, just structure)
-              if ($affectedObjects.tables -and $affectedObjects.tables.Count -gt 0) {
-                  Write-Host "Backing up user table schemas..."
-                  
-                  $tableQuery = @"
-SELECT 
-    t.name as TableName,
-    OBJECT_SCHEMA_NAME(t.object_id) as SchemaName,
-    (
-        SELECT 
-            c.name + ' ' + 
-            TYPE_NAME(c.user_type_id) + 
-            CASE 
-                WHEN TYPE_NAME(c.user_type_id) IN ('varchar', 'nvarchar', 'char', 'nchar') 
-                THEN '(' + CAST(c.max_length as varchar) + ')' 
-                WHEN TYPE_NAME(c.user_type_id) IN ('decimal', 'numeric')
-                THEN '(' + CAST(c.precision as varchar) + ',' + CAST(c.scale as varchar) + ')'
-                ELSE ''
-            END + 
-            CASE WHEN c.is_nullable = 0 THEN ' NOT NULL' ELSE ' NULL' END + ','
-        FROM sys.columns c
-        WHERE c.object_id = t.object_id
-        ORDER BY c.column_id
-        FOR XML PATH('')
-    ) as ColumnDefinitions
-FROM sys.tables t
-WHERE t.is_ms_shipped = 0  -- Exclude system tables
-  AND t.name NOT LIKE 'sys%'
-"@
-                  
-                  if ($affectedObjects.tables[0] -ne '*') {
-                      $tableList = ($affectedObjects.tables | ForEach-Object { "'$_'" }) -join ','
-                      $tableQuery += "`n  AND t.name IN ($tableList)"
-                  }
-                  
-                  try {
-                      $tables = Invoke-Sqlcmd -ConnectionString $connectionString -Query $tableQuery -MaxCharLength 65535 -ErrorAction Stop
-                      
-                      if ($tables) {
-                          $backupScript += "`r`n-- ========================================`r`n"
-                          $backupScript += "-- TABLE SCHEMAS (User Objects)`r`n"
-                          $backupScript += "-- Note: Only structure, not data`r`n"
-                          $backupScript += "-- ========================================`r`n`r`n"
-                          
-                          foreach ($table in $tables) {
-                              $fullName = "$($table.SchemaName).$($table.TableName)"
-                              Write-Host "  Backing up table schema: $fullName"
-                              
-                              $backupScript += "-- Table: $fullName`r`n"
-                              $backupScript += "-- Backed up: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
-                              $backupScript += "/*`r`n"
-                              $backupScript += "CREATE TABLE $fullName (`r`n"
-                              $backupScript += "    " + $table.ColumnDefinitions.TrimEnd(',') + "`r`n"
-                              $backupScript += ")`r`n"
-                              $backupScript += "*/`r`n"
-                              $backupScript += "GO`r`n`r`n"
-                              $objectsBackedUp++
-                          }
-                      } else {
-                          Write-Host "  No user tables found to backup"
-                      }
-                  }
-                  catch {
-                      Write-Warning "Failed to backup table schemas: $($_.Exception.Message)"
-                  }
-              }
-              
-              # Save backup file
               if ($objectsBackedUp -eq 0) {
                   Write-Host "⚠️  No user objects found to backup"
                   $backupScript += "`r`n-- No user objects found to backup`r`n"
@@ -778,7 +592,6 @@ WHERE t.is_ms_shipped = 0  -- Exclude system tables
               Write-Host "Backup saved to: $backupFile"
               Write-Host "Total objects backed up: $objectsBackedUp"
               
-              # Upload to Azure Blob Storage
               Write-Host "Uploading backup to Azure Storage..."
               $blobName = "backup_$(Build.BuildNumber)_$timestamp.sql"
               
@@ -796,14 +609,12 @@ WHERE t.is_ms_shipped = 0  -- Exclude system tables
               Write-Host "  Objects backed up: $objectsBackedUp"
               Write-Host "  Backup location: $(backupContainerName)/$blobName"
               
-              # Set variables for next stages
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
               Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]$blobName"
               Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]$objectsBackedUp"
           }
           catch {
               Write-Error "Backup failed: $($_.Exception.Message)"
-              Write-Host "##vso[task.logissue type=error]Backup operation failed: $($_.Exception.Message)"
               exit 1
           }
 
@@ -830,7 +641,7 @@ WHERE t.is_ms_shipped = 0  -- Exclude system tables
   
   jobs:
   - job: ExecuteScript
-    displayName: 'Run SQL Script with Transaction'
+    displayName: 'Run SQL Script'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 60
@@ -858,10 +669,6 @@ WHERE t.is_ms_shipped = 0  -- Exclude system tables
               Write-Host "Retrieving connection string..."
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
               
-              if ([string]::IsNullOrEmpty($connectionString)) {
-                  throw "Failed to retrieve connection string"
-              }
-              
               Write-Host "Reading SQL script..."
               $scriptContent = Get-Content -Path '$(Pipeline.Workspace)/sql/script.sql' -Raw
               
@@ -869,188 +676,85 @@ WHERE t.is_ms_shipped = 0  -- Exclude system tables
                   throw "SQL script is empty"
               }
               
-              # Create execution log directory
               New-Item -ItemType Directory -Force -Path "$(logsPath)" | Out-Null
               $logFile = "$(logsPath)/execution_log.txt"
               
-              # Log execution start
               $logHeader = @"
-========================================
-SQL SCRIPT EXECUTION LOG
-========================================
-Build: $(Build.BuildNumber)
-Script: ${{ parameters.sqlScriptName }}
-Executed By: $(Build.RequestedFor)
-Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-========================================
-
-"@
+          ========================================
+          SQL SCRIPT EXECUTION LOG
+          ========================================
+          Build: $(Build.BuildNumber)
+          Script: ${{ parameters.sqlScriptName }}
+          Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          ========================================
+          
+          "@
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # Split script by GO statements (case-insensitive, handles comments)
               $statements = $scriptContent -split "(?mi)^\s*GO\s*$" | Where-Object { $_.Trim() -ne "" }
               
-              Write-Host "Found $($statements.Count) statement batch(es) to execute"
-              Write-Host ""
+              Write-Host "Found $($statements.Count) statement batch(es)"
               
               $executedCount = 0
-              $failedStatements = @()
               $totalDuration = [TimeSpan]::Zero
               
-              # Execute each statement batch
               foreach ($i in 0..($statements.Count - 1)) {
                   $statement = $statements[$i].Trim()
                   
-                  # Skip empty statements or comments-only blocks
                   if ([string]::IsNullOrWhiteSpace($statement)) {
                       continue
                   }
                   
-                  # Skip if statement is only comments
-                  $nonCommentContent = $statement -replace '--.*, '' -replace '/\*[\s\S]*?\*/', ''
-                  if ([string]::IsNullOrWhiteSpace($nonCommentContent)) {
-                      Write-Host "Skipping comment-only batch $($i + 1)"
-                      continue
-                  }
-                  
                   $batchNum = $i + 1
-                  $preview = if ($statement.Length -gt 150) { 
-                      $statement.Substring(0, 150) + "..." 
-                  } else { 
-                      $statement 
-                  }
+                  $preview = if ($statement.Length -gt 150) { $statement.Substring(0, 150) + "..." } else { $statement }
                   
-                  Write-Host "=" * 70
-                  Write-Host "Executing batch $batchNum of $($statements.Count)"
-                  Write-Host "=" * 70
-                  Write-Host $preview
                   Write-Host ""
+                  Write-Host "Executing batch $batchNum of $($statements.Count)"
+                  Write-Host $preview
                   
-                  # Log to file
                   "Batch $batchNum - $(Get-Date -Format 'HH:mm:ss')" | Out-File -FilePath $logFile -Append
                   $preview | Out-File -FilePath $logFile -Append
-                  "" | Out-File -FilePath $logFile -Append
                   
                   try {
                       $startTime = Get-Date
                       
-                      # Execute statement with detailed error handling
-                      $result = Invoke-Sqlcmd -ConnectionString $connectionString `
-                                              -Query $statement `
-                                              -QueryTimeout 600 `
-                                              -ErrorAction Stop `
-                                              -Verbose 4>&1
+                      Invoke-Sqlcmd -ConnectionString $connectionString `
+                                    -Query $statement `
+                                    -QueryTimeout 600 `
+                                    -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
                       $totalDuration += $duration
                       $executedCount++
                       
-                      $successMsg = "✓ Batch $batchNum completed successfully in $([math]::Round($duration.TotalSeconds, 2))s"
+                      $successMsg = "✓ Batch $batchNum completed in $([math]::Round($duration.TotalSeconds, 2))s"
                       Write-Host $successMsg -ForegroundColor Green
-                      
-                      # Log any output from the query
-                      if ($result) {
-                          Write-Host "  Query returned $($result.Count) row(s)"
-                          "  Rows affected: $($result.Count)" | Out-File -FilePath $logFile -Append
-                      }
-                      
                       "$successMsg`n" | Out-File -FilePath $logFile -Append
-                      Write-Host ""
                   }
                   catch {
-                      $duration = (Get-Date) - $startTime
-                      $errorMsg = "✗ Batch $batchNum failed after $([math]::Round($duration.TotalSeconds, 2))s"
-                      $errorDetail = $_.Exception.Message
-                      
+                      $errorMsg = "✗ Batch $batchNum failed: $($_.Exception.Message)"
                       Write-Host $errorMsg -ForegroundColor Red
-                      Write-Host "  Error: $errorDetail" -ForegroundColor Red
-                      Write-Host ""
-                      
-                      "$errorMsg" | Out-File -FilePath $logFile -Append
-                      "Error: $errorDetail`n" | Out-File -FilePath $logFile -Append
-                      
-                      $failedStatements += @{
-                          Batch = $batchNum
-                          Error = $errorDetail
-                          Statement = $preview
-                          Duration = $duration.TotalSeconds
-                      }
-                      
-                      # Log error and stop execution
-                      Write-Host "##vso[task.logissue type=error]Batch $batchNum failed: $errorDetail"
-                      throw "SQL execution failed at batch $batchNum. Error: $errorDetail"
+                      "$errorMsg`n" | Out-File -FilePath $logFile -Append
+                      throw "SQL execution failed at batch $batchNum"
                   }
               }
               
-              # Success summary
               Write-Host ""
-              Write-Host "=" * 70 -ForegroundColor Green
               Write-Host "✓ SQL SCRIPT EXECUTED SUCCESSFULLY" -ForegroundColor Green
-              Write-Host "=" * 70 -ForegroundColor Green
-              Write-Host "Build: $(Build.BuildNumber)" -ForegroundColor Green
-              Write-Host "Batches executed: $executedCount of $($statements.Count)" -ForegroundColor Green
+              Write-Host "Batches executed: $executedCount" -ForegroundColor Green
               Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
-              Write-Host "Average batch time: $([math]::Round($totalDuration.TotalSeconds / $executedCount, 2))s" -ForegroundColor Green
-              Write-Host "=" * 70 -ForegroundColor Green
               
-              $successSummary = @"
-
-========================================
-EXECUTION COMPLETED SUCCESSFULLY
-========================================
-Batches executed: $executedCount of $($statements.Count)
-Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s
-Average batch time: $([math]::Round($totalDuration.TotalSeconds / $executedCount, 2))s
-Completed: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-========================================
-"@
-              $successSummary | Out-File -FilePath $logFile -Append
-              
-              # Set success variables
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
               Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
               Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration.TotalSeconds, 2))"
           }
           catch {
               Write-Host ""
-              Write-Host "=" * 70 -ForegroundColor Red
               Write-Host "✗ SQL SCRIPT EXECUTION FAILED" -ForegroundColor Red
-              Write-Host "=" * 70 -ForegroundColor Red
               Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
               
-              if ($failedStatements.Count -gt 0) {
-                  Write-Host "`nFailed Statement Details:" -ForegroundColor Red
-                  foreach ($failed in $failedStatements) {
-                      Write-Host "  Batch $($failed.Batch):" -ForegroundColor Red
-                      Write-Host "    Duration: $([math]::Round($failed.Duration, 2))s" -ForegroundColor Red
-                      Write-Host "    Error: $($failed.Error)" -ForegroundColor Red
-                      Write-Host "    Statement: $($failed.Statement.Substring(0, [Math]::Min(100, $failed.Statement.Length)))" -ForegroundColor Red
-                  }
-              }
-              
-              Write-Host "=" * 70 -ForegroundColor Red
-              
-              $errorSummary = @"
-
-========================================
-EXECUTION FAILED
-========================================
-Error: $($_.Exception.Message)
-Batches executed: $executedCount
-Failed at: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-
-Failed Statement Details:
-"@
-              $errorSummary | Out-File -FilePath $logFile -Append
-              
-              foreach ($failed in $failedStatements) {
-                  "  Batch $($failed.Batch): $($failed.Error)" | Out-File -FilePath $logFile -Append
-              }
-              
-              # Set failure variables
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
-              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
-              Write-Host "##vso[task.complete result=Failed;]SQL execution failed"
+              Write-Host "##vso[task.logissue type=error]SQL execution failed"
               
               exit 1
           }
@@ -1090,9 +794,6 @@ Failed Statement Details:
           $buildNumber = "$(Build.BuildNumber)"
           $scriptName = "${{ parameters.sqlScriptName }}"
           $isDryRun = "${{ parameters.dryRun }}"
-          $executedCount = "$(ExecuteSQL.executedCount)"
-          $duration = "$(ExecuteSQL.totalDuration)"
-          $objectsBackedUp = "$(BackupObjects.objectsBackedUp)"
           
           Write-Host ""
           Write-Host "=" * 70
@@ -1102,100 +803,20 @@ Failed Statement Details:
           Write-Host "Script Name: $scriptName"
           Write-Host "Dry Run Mode: $isDryRun"
           Write-Host "Executed By: $(Build.RequestedFor)"
-          Write-Host "Started: $(Build.StartTime)"
           
           if ($isDryRun -eq "true") {
               Write-Host ""
               Write-Host "✓ DRY RUN COMPLETED - VALIDATION ONLY" -ForegroundColor Cyan
-              Write-Host "  No changes were made to the database"
           }
           elseif ($result -eq "Success") {
               Write-Host ""
               Write-Host "✓ EXECUTION SUCCESSFUL" -ForegroundColor Green
-              Write-Host "  Batches Executed: $executedCount"
-              Write-Host "  Total Duration: ${duration}s"
-              if ($objectsBackedUp) {
-                  Write-Host "  Objects Backed Up: $objectsBackedUp"
-              }
-              
-              # TODO: Send success notification
-              # Example - Microsoft Teams Webhook:
-              <#
-              $teamsWebhook = "YOUR_TEAMS_WEBHOOK_URL"
-              $body = @{
-                  "@type" = "MessageCard"
-                  "@context" = "https://schema.org/extensions"
-                  "themeColor" = "00FF00"
-                  "title" = "✓ SQL Deployment Successful"
-                  "summary" = "Build $buildNumber completed successfully"
-                  "sections" = @(
-                      @{
-                          "activityTitle" = "Deployment Details"
-                          "facts" = @(
-                              @{ "name" = "Build"; "value" = $buildNumber }
-                              @{ "name" = "Script"; "value" = $scriptName }
-                              @{ "name" = "Batches"; "value" = $executedCount }
-                              @{ "name" = "Duration"; "value" = "${duration}s" }
-                              @{ "name" = "Executed By"; "value" = "$(Build.RequestedFor)" }
-                          )
-                      }
-                  )
-                  "potentialAction" = @(
-                      @{
-                          "@type" = "OpenUri"
-                          "name" = "View Build"
-                          "targets" = @(
-                              @{ "os" = "default"; "uri" = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" }
-                          )
-                      }
-                  )
-              } | ConvertTo-Json -Depth 10
-              
-              Invoke-RestMethod -Uri $teamsWebhook -Method Post -Body $body -ContentType 'application/json'
-              #>
-              
           } else {
               Write-Host ""
               Write-Host "✗ EXECUTION FAILED" -ForegroundColor Red
-              Write-Host "  Batches Attempted: $executedCount"
-              Write-Host "  Check execution logs for details"
-              
-              # TODO: Send failure notification
-              <#
-              $teamsWebhook = "YOUR_TEAMS_WEBHOOK_URL"
-              $body = @{
-                  "@type" = "MessageCard"
-                  "@context" = "https://schema.org/extensions"
-                  "themeColor" = "FF0000"
-                  "title" = "✗ SQL Deployment Failed"
-                  "summary" = "Build $buildNumber failed"
-                  "sections" = @(
-                      @{
-                          "activityTitle" = "Failure Details"
-                          "facts" = @(
-                              @{ "name" = "Build"; "value" = $buildNumber }
-                              @{ "name" = "Script"; "value" = $scriptName }
-                              @{ "name" = "Executed By"; "value" = "$(Build.RequestedFor)" }
-                          )
-                      }
-                  )
-                  "potentialAction" = @(
-                      @{
-                          "@type" = "OpenUri"
-                          "name" = "View Build Logs"
-                          "targets" = @(
-                              @{ "os" = "default"; "uri" = "$(System.CollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)" }
-                          )
-                      }
-                  )
-              } | ConvertTo-Json -Depth 10
-              
-              Invoke-RestMethod -Uri $teamsWebhook -Method Post -Body $body -ContentType 'application/json'
-              #>
           }
           
           Write-Host "=" * 70
-          Write-Host ""
 
     - task: AzurePowerShell@5
       displayName: 'Create Audit Trail'
@@ -1208,44 +829,31 @@ Failed Statement Details:
           $ErrorActionPreference = "Continue"
           
           try {
-              # Create audit log entry
               $auditLog = @{
                   buildNumber = "$(Build.BuildNumber)"
                   buildId = "$(Build.BuildId)"
                   scriptName = "${{ parameters.sqlScriptName }}"
                   executionResult = "$(ExecuteSQL.executionResult)"
                   executedBy = "$(Build.RequestedFor)"
-                  executedByEmail = "$(Build.RequestedForEmail)"
                   executedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-                  repository = "$(Build.Repository.Name)"
-                  branch = "$(Build.SourceBranchName)"
                   dryRun = "${{ parameters.dryRun }}"
-                  batchesExecuted = "$(ExecuteSQL.executedCount)"
-                  duration = "$(ExecuteSQL.totalDuration)"
-                  objectsBackedUp = "$(BackupObjects.objectsBackedUp)"
-                  backupBlobName = "$(BackupObjects.backupBlobName)"
               } | ConvertTo-Json
               
-              # Save to file
               $auditFile = "audit_$(Build.BuildNumber)_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
               $auditLog | Out-File -FilePath $auditFile -Encoding UTF8
               
               Write-Host "Audit log created: $auditFile"
               
-              # Upload to blob storage
               $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
               
               if ($storageAccount) {
                   $ctx = $storageAccount.Context
                   
-                  # Create audit-logs container if it doesn't exist
                   $container = Get-AzStorageContainer -Name "audit-logs" -Context $ctx -ErrorAction SilentlyContinue
                   if (-not $container) {
                       New-AzStorageContainer -Name "audit-logs" -Context $ctx -Permission Off
-                      Write-Host "Created audit-logs container"
                   }
                   
-                  # Upload audit log
                   Set-AzStorageBlobContent `
                       -File $auditFile `
                       -Container "audit-logs" `
@@ -1254,12 +862,8 @@ Failed Statement Details:
                       -Force
                   
                   Write-Host "✓ Audit log uploaded to blob storage"
-                  Write-Host "  Location: audit-logs/$auditFile"
-              } else {
-                  Write-Warning "Storage account not found, audit log saved locally only"
               }
           }
           catch {
               Write-Warning "Failed to create audit trail: $($_.Exception.Message)"
-              # Don't fail the pipeline if audit logging fails
           }
