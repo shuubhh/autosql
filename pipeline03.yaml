@@ -28,7 +28,7 @@ variables:
   containerName: 'rawsql'
   backupContainerName: 'backups'
   keyVaultName: 'sql-validator-kv'
-  secretName: 'sql-connection-string'
+  secretName: 'sql-conn-string'
 
 stages:
 - stage: Download_And_Validate
