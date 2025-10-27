@@ -62,8 +62,19 @@ stages:
           try {
               $pythonVersion = python --version 2>&1
               Write-Host "Python: $pythonVersion"
+              
+              # Check if sqlparse is installed
+              $sqlparseCheck = python -c "import sqlparse; print('sqlparse is available')" 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "Installing sqlparse module..."
+                  python -m pip install sqlparse==0.4.4
+              } else {
+                  Write-Host "✓ sqlparse module is already installed"
+              }
           } catch {
-              Write-Error "Python not found. Please install Python 3.x"
+              Write-Error "Python not found or not working properly. Please ensure Python 3.x is installed and in PATH"
+              Write-Host "Available Python versions:"
+              Get-Command python* -CommandType Application | Format-Table Name, Path
               exit 1
           }
           
@@ -151,17 +162,6 @@ stages:
       inputs:
         artifact: 'SQLScript'
         path: '$(Pipeline.Workspace)/sql'
-
-    - task: UsePythonVersion@0
-      displayName: 'Use Python 3.x'
-      inputs:
-        versionSpec: '3.x'
-        addToPath: true
-
-    - script: |
-        python -m pip install --upgrade pip
-        pip install sqlparse==0.4.4
-      displayName: 'Install Python Dependencies'
 
     - task: PythonScript@0
       name: SQLValidation
@@ -380,7 +380,7 @@ stages:
                   if not issues and not warnings:
                       f.write("✓ No security issues detected\n\n")
                   
-                  f.write("=" * 70 + "\n")
+                  f.write("=== END OF REPORT ===")
               
               affected_path = os.path.join(report_dir, 'affected_objects.json')
               with open(affected_path, 'w') as f:
