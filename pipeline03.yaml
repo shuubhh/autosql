@@ -1,6 +1,6 @@
 name: $(Date:yyyyMMdd)$(Rev:.r)
 
-trigger: none # Manual trigger only
+trigger: none
 
 parameters:
 - name: sqlScriptName
@@ -50,7 +50,6 @@ stages:
         script: |
           Write-Host "Checking agent prerequisites..."
           
-          # Check PowerShell version
           $psVersion = $PSVersionTable.PSVersion
           Write-Host "PowerShell Version: $psVersion"
           if ($psVersion.Major -lt 5) {
@@ -58,12 +57,10 @@ stages:
               exit 1
           }
           
-          # Check Python
           try {
               $pythonVersion = python --version 2>&1
               Write-Host "Python: $pythonVersion"
               
-              # Check if sqlparse is installed
               $sqlparseCheck = python -c "import sqlparse; print('sqlparse is available')" 2>&1
               if ($LASTEXITCODE -ne 0) {
                   Write-Host "Installing sqlparse module..."
@@ -73,19 +70,16 @@ stages:
               }
           } catch {
               Write-Error "Python not found or not working properly. Please ensure Python 3.x is installed and in PATH"
-              Write-Host "Available Python versions:"
               Get-Command python* -CommandType Application | Format-Table Name, Path
               exit 1
           }
           
-          # Check Az PowerShell module
           $azModule = Get-Module -ListAvailable -Name Az.Accounts, Az.KeyVault, Az.Storage
           if (-not $azModule) {
               Write-Host "Installing Az PowerShell modules..."
               Install-Module -Name Az.Accounts, Az.KeyVault, Az.Storage -Force -AllowClobber -Scope CurrentUser
           }
           
-          # Check SqlServer module
           $sqlModule = Get-Module -ListAvailable -Name SqlServer
           if (-not $sqlModule) {
               Write-Host "Installing SqlServer PowerShell module..."
@@ -109,7 +103,6 @@ stages:
               
               Write-Host "Downloading script: ${{ parameters.sqlScriptName }}"
               
-              # Get storage account context
               $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
               
               if (-not $storageAccount) {
@@ -118,7 +111,6 @@ stages:
               
               $ctx = $storageAccount.Context
               
-              # Download blob
               Get-AzStorageBlobContent `
                   -Container "$(containerName)" `
                   -Blob "${{ parameters.sqlScriptName }}" `
@@ -176,21 +168,18 @@ stages:
           import re
           import json
           
-          # Debug: Print environment variables and check paths
           print("=== DEBUG INFORMATION ===")
           print("Environment Variables:")
           for key, value in sorted(os.environ.items()):
               if any(term in key for term in ['WORK', 'AGENT', 'PIPELINE', 'BUILD', 'SCRIPT', 'SYSTEM']):
                   print(f"  {key}: {value}")
           
-          # Get paths from environment variables
           pipeline_workspace = os.environ.get('PIPELINE_WORKSPACE')
           sql_script_path = os.environ.get('SQL_SCRIPT_PATH')
           
           print(f"\nPipeline Workspace from env: {pipeline_workspace}")
           print(f"SQL Script Path from env: {sql_script_path}")
           
-          # If environment variables are not set, try alternative approaches
           if not pipeline_workspace:
               print("PIPELINE_WORKSPACE not found in environment, trying alternatives...")
               possible_workspaces = [
@@ -210,11 +199,10 @@ stages:
                   sql_script_path = os.path.join(pipeline_workspace, 'sql', 'script.sql')
                   print(f"Constructed script path: {sql_script_path}")
           
-          # Normalize paths
           if pipeline_workspace:
               report_dir = os.path.join(pipeline_workspace, 'sql')
           else:
-              report_dir = 'sql'  # Fallback
+              report_dir = 'sql'
               
           script_path = sql_script_path
           
@@ -222,12 +210,10 @@ stages:
           print(f"Report Directory: {report_dir}")
           print(f"Script Path: {script_path}")
           
-          # Check if script file exists
           print(f"\nFile Check:")
           print(f"Script exists: {os.path.exists(script_path) if script_path else 'No path'}")
           if script_path and os.path.exists(script_path):
               print(f"Script size: {os.path.getsize(script_path)} bytes")
-              # Show first few lines of the script
               try:
                   with open(script_path, 'r', encoding='utf-8') as f:
                       first_lines = [f.readline().strip() for _ in range(5) if f.readline()]
@@ -235,7 +221,6 @@ stages:
               except Exception as e:
                   print(f"Error reading script: {e}")
           else:
-              # List files in possible locations
               print("Searching for SQL files...")
               search_dirs = [pipeline_workspace, 'sql', '.', os.path.join(pipeline_workspace, 'sql') if pipeline_workspace else 'sql']
               for search_dir in search_dirs:
@@ -250,7 +235,6 @@ stages:
           
           print("=== END DEBUG ===\n")
           
-          # Validate that we have a script path
           if not script_path or not os.path.exists(script_path):
               print("##vso[task.logissue type=error]SQL script not found")
               print(f"##vso[task.logissue type=error]Expected path: {script_path}")
@@ -340,11 +324,9 @@ stages:
               return affected
           
           def generate_report(file_path, syntax_ok, issues, warnings, affected):
-              # Use the report_dir we defined earlier
               os.makedirs(report_dir, exist_ok=True)
               report_path = os.path.join(report_dir, 'validation_report.txt')
               
-              # Use UTF-8 encoding to handle special characters
               with open(report_path, 'w', encoding='utf-8') as f:
                   f.write("=" * 70 + "\n")
                   f.write("SQL VALIDATION REPORT\n")
@@ -559,7 +541,6 @@ stages:
               
               Write-Host "Starting database backup process..."
               
-              # Backup ALL user stored procedures (not just affected ones)
               Write-Host "Backing up ALL user-created stored procedures..."
               $procQuery = @"
 SELECT 
@@ -603,7 +584,6 @@ WHERE is_ms_shipped = 0
                   Write-Warning "Failed to backup procedures: $($_.Exception.Message)"
               }
               
-              # Backup ALL user functions
               Write-Host "Backing up ALL user-created functions..."
               $funcQuery = @"
 SELECT 
@@ -646,7 +626,6 @@ WHERE type IN ('FN', 'IF', 'TF', 'FS', 'FT')
                   Write-Warning "Failed to backup functions: $($_.Exception.Message)"
               }
               
-              # Backup ALL user views
               Write-Host "Backing up ALL user-created views..."
               $viewQuery = @"
 SELECT 
@@ -694,12 +673,10 @@ WHERE is_ms_shipped = 0
                   $backupScript += "`r`n-- No user objects found to backup`r`n"
               }
               
-              # Write backup file
               $backupScript | Out-File -FilePath $backupFile -Encoding UTF8
               Write-Host "Backup saved to: $backupFile"
               Write-Host "Total objects backed up: $objectsBackedUp"
               
-              # Upload to Azure Storage
               Write-Host "Uploading backup to Azure Storage..."
               $blobName = "backup_$(Build.BuildNumber)_$timestamp.sql"
               
@@ -793,7 +770,6 @@ WHERE is_ms_shipped = 0
                   throw "SQL script file not found: $scriptPath"
               }
               
-              # Read file content properly
               $scriptContent = [System.IO.File]::ReadAllText($scriptPath)
               
               if ([string]::IsNullOrWhiteSpace($scriptContent)) {
@@ -819,7 +795,6 @@ Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 "@
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # Improved statement splitting that handles different line endings
               $statements = $scriptContent -split "\s*GO\s*" | Where-Object { 
                   $_.Trim() -ne "" -and $_.Trim() -ne "`r" -and $_.Trim() -ne "`n" 
               }
@@ -854,7 +829,6 @@ Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
                   try {
                       $startTime = Get-Date
                       
-                      # Execute the SQL statement
                       $result = Invoke-Sqlcmd -ConnectionString $connectionString `
                                               -Query $statement `
                                               -QueryTimeout 600 `
