@@ -151,16 +151,16 @@ stages:
         artifact: 'SQLScript'
         path: '$(Pipeline.Workspace)/sql'
 
-    - task: UsePythonVersion@0
-      displayName: 'Use Python 3.x'
-      inputs:
-        versionSpec: '3.x'
-        addToPath: true
+    #- task: UsePythonVersion@0
+      #displayName: 'Use Python 3.x'
+      #inputs:
+      #  versionSpec: '3.x'
+     #   addToPath: true
 
-    - script: |
-        python -m pip install --upgrade pip
-        pip install sqlparse==0.4.4
-      displayName: 'Install Python Dependencies'
+    #- script: |
+        #python -m pip install --upgrade pip
+       # pip install sqlparse==0.4.4
+      #displayName: 'Install Python Dependencies'
 
     - task: PythonScript@0
       name: SQLValidation
