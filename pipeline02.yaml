@@ -269,7 +269,7 @@ stages:
                       print("##vso[task.logissue type=error]Failed to parse SQL content")
                       return False
                   
-                  print("✓ Basic SQL syntax is valid")
+                  print("Basic SQL syntax is valid")
                   print(f"  Found {len(parsed)} SQL statement(s)")
                   return True
               except Exception as e:
@@ -343,7 +343,8 @@ stages:
               os.makedirs(report_dir, exist_ok=True)
               report_path = os.path.join(report_dir, 'validation_report.txt')
               
-              with open(report_path, 'w') as f:
+              # Use UTF-8 encoding to handle special characters
+              with open(report_path, 'w', encoding='utf-8') as f:
                   f.write("=" * 70 + "\n")
                   f.write("SQL VALIDATION REPORT\n")
                   f.write("=" * 70 + "\n\n")
@@ -367,26 +368,26 @@ stages:
                       f.write(f"CRITICAL ISSUES ({len(issues)}):\n")
                       f.write("-" * 70 + "\n")
                       for issue in issues:
-                          f.write(f"  ⚠️  {issue}\n")
+                          f.write(f"  [ISSUE] {issue}\n")
                       f.write("\n")
                   
                   if warnings:
                       f.write(f"WARNINGS ({len(warnings)}):\n")
                       f.write("-" * 70 + "\n")
                       for warning in warnings:
-                          f.write(f"  ℹ️  {warning}\n")
+                          f.write(f"  [INFO] {warning}\n")
                       f.write("\n")
                   
                   if not issues and not warnings:
-                      f.write("✓ No security issues detected\n\n")
+                      f.write("No security issues detected\n\n")
                   
-                  f.write("=== END OF REPORT ===")
+                  f.write("=" * 70 + "\n")
               
               affected_path = os.path.join(report_dir, 'affected_objects.json')
-              with open(affected_path, 'w') as f:
+              with open(affected_path, 'w', encoding='utf-8') as f:
                   json.dump(affected, f, indent=2)
               
-              print(f"✓ Validation report generated: {report_path}")
+              print(f"Validation report generated: {report_path}")
           
           print(f"Validating SQL script: {script_path}\n")
           
@@ -398,19 +399,19 @@ stages:
           
           if issues:
               print("\n" + "=" * 70)
-              print(f"❌ CRITICAL ISSUES FOUND ({len(issues)}):")
+              print(f"CRITICAL ISSUES FOUND ({len(issues)}):")
               print("=" * 70)
               for issue in issues:
                   print(f"  {issue}")
                   print(f"##vso[task.logissue type=error]{issue}")
               print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true')
           else:
-              print("\n✓ No critical security issues found")
+              print("\nNo critical security issues found")
               print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]false')
           
           if warnings:
               print("\n" + "=" * 70)
-              print(f"⚠️  WARNINGS ({len(warnings)}):")
+              print(f"WARNINGS ({len(warnings)}):")
               print("=" * 70)
               for warning in warnings:
                   print(f"  {warning}")
@@ -420,7 +421,7 @@ stages:
               print("\n##vso[task.complete result=Failed;]Syntax validation failed")
               sys.exit(1)
           
-          print("\n✓ Validation completed successfully")
+          print("\nValidation completed successfully")
       env:
         PIPELINE_WORKSPACE: $(Pipeline.Workspace)
         SQL_SCRIPT_PATH: $(sqlScriptPath)
@@ -453,7 +454,7 @@ stages:
       displayName: 'Review and Approve Security Issues'
       inputs:
         instructions: |
-          ⚠️ SECURITY ISSUES DETECTED ⚠️
+          SECURITY ISSUES DETECTED
           
           The SQL script contains potential security issues that require review.
           
@@ -669,7 +670,7 @@ stages:
               }
               
               if ($objectsBackedUp -eq 0) {
-                  Write-Host "⚠️  No user objects found to backup"
+                  Write-Host "No user objects found to backup"
                   $backupScript += "`r`n-- No user objects found to backup`r`n"
               }
               
@@ -690,7 +691,7 @@ stages:
                   -Context $ctx `
                   -Force
               
-              Write-Host "✓ Backup completed successfully"
+              Write-Host "Backup completed successfully"
               Write-Host "  Objects backed up: $objectsBackedUp"
               Write-Host "  Backup location: $(backupContainerName)/$blobName"
               
@@ -812,12 +813,12 @@ stages:
                       $totalDuration += $duration
                       $executedCount++
                       
-                      $successMsg = "✓ Batch $batchNum completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      $successMsg = "Batch $batchNum completed in $([math]::Round($duration.TotalSeconds, 2))s"
                       Write-Host $successMsg -ForegroundColor Green
                       "$successMsg`n" | Out-File -FilePath $logFile -Append
                   }
                   catch {
-                      $errorMsg = "✗ Batch $batchNum failed: $($_.Exception.Message)"
+                      $errorMsg = "Batch $batchNum failed: $($_.Exception.Message)"
                       Write-Host $errorMsg -ForegroundColor Red
                       "$errorMsg`n" | Out-File -FilePath $logFile -Append
                       throw "SQL execution failed at batch $batchNum"
@@ -825,7 +826,7 @@ stages:
               }
               
               Write-Host ""
-              Write-Host "✓ SQL SCRIPT EXECUTED SUCCESSFULLY" -ForegroundColor Green
+              Write-Host "SQL SCRIPT EXECUTED SUCCESSFULLY" -ForegroundColor Green
               Write-Host "Batches executed: $executedCount" -ForegroundColor Green
               Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
               
@@ -835,7 +836,7 @@ stages:
           }
           catch {
               Write-Host ""
-              Write-Host "✗ SQL SCRIPT EXECUTION FAILED" -ForegroundColor Red
+              Write-Host "SQL SCRIPT EXECUTION FAILED" -ForegroundColor Red
               Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
               
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
@@ -891,14 +892,14 @@ stages:
           
           if ($isDryRun -eq "true") {
               Write-Host ""
-              Write-Host "✓ DRY RUN COMPLETED - VALIDATION ONLY" -ForegroundColor Cyan
+              Write-Host "DRY RUN COMPLETED - VALIDATION ONLY" -ForegroundColor Cyan
           }
           elseif ($result -eq "Success") {
               Write-Host ""
-              Write-Host "✓ EXECUTION SUCCESSFUL" -ForegroundColor Green
+              Write-Host "EXECUTION SUCCESSFUL" -ForegroundColor Green
           } else {
               Write-Host ""
-              Write-Host "✗ EXECUTION FAILED" -ForegroundColor Red
+              Write-Host "EXECUTION FAILED" -ForegroundColor Red
           }
           
           Write-Host "=" * 70
@@ -946,7 +947,7 @@ stages:
                       -Context $ctx `
                       -Force
                   
-                  Write-Host "✓ Audit log uploaded to blob storage"
+                  Write-Host "Audit log uploaded to blob storage"
               }
           }
           catch {
