@@ -258,7 +258,7 @@ stages:
               return affected
           
           def generate_report(file_path, syntax_ok, issues, warnings, affected):
-              report_dir = '$(Pipeline.Workspace)/sql'
+              report_dir = os.path.normpath('$(Pipeline.Workspace)/sql'.replace('\\', '/'))
               os.makedirs(report_dir, exist_ok=True)
               report_path = os.path.join(report_dir, 'validation_report.txt')
               
@@ -305,7 +305,7 @@ stages:
               with open(affected_path, 'w') as f:
                   json.dump(affected, f, indent=2)
           
-          script_path = '$(sqlScriptPath)'
+          script_path = os.path.normpath('$(sqlScriptPath)'.replace('\\', '/'))
           print(f"Validating SQL script: {script_path}\n")
           
           syntax_ok = validate_sql_syntax(script_path)
