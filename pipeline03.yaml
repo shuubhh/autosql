@@ -472,7 +472,11 @@ stages:
           Script: ${{ parameters.sqlScriptName }}
           Build: $(Build.BuildNumber)
         onTimeout: 'reject'
-
+    - task: ManualValidation@1
+      inputs:
+        notifyUsers: 'shubh.bhanushali@g7cr.com'
+        approvers: 'shubh.bhanushali@g7cr.com'
+        instructions: 'Vulnerability present. please check validation report in order to cancel or approve the run'
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
   dependsOn: 
