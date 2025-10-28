@@ -562,11 +562,11 @@ stages:
     steps:
     
     - task: ManualValidation@1
-    inputs:
-      notifyUsers: 'shubh.bhanushali@g7cr.com'
-      approvers: 'shubh.bhanushali@g7cr.com'
-      instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
-      onTimeout: 'reject'
+      inputs:
+        notifyUsers: 'shubh.bhanushali@g7cr.com'
+        approvers: 'shubh.bhanushali@g7cr.com'
+        instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
+        onTimeout: 'reject'
 
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
