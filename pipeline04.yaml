@@ -566,6 +566,7 @@ stages:
        # notifyUsers: 'shubh.bhanushali@g7cr.com'
         approvers: 'shubh.bhanushali@g7cr.com'
         instructions: 'Security issues or warnings detected. Please check validation report and approve or cancel the run.'
+        onTimeout: 'reject'
 
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
