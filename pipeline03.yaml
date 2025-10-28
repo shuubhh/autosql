@@ -455,24 +455,12 @@ stages:
     timeoutInMinutes: 1440
     
     steps:
-    - task: ManualValidation@0
-      displayName: 'Review and Approve Security Issues'
+    
+    - task: ManualValidation@1
       inputs:
-        instructions: |
-          SECURITY ISSUES DETECTED
-          
-          The SQL script contains potential security issues that require review.
-          
-          Please:
-          1. Download and review the ValidationReport artifact
-          2. Verify the security issues are acceptable
-          3. Ensure proper authorization for dangerous operations
-          4. Approve only if you accept the risks
-          
-          Script: ${{ parameters.sqlScriptName }}
-          Build: $(Build.BuildNumber)
-        onTimeout: 'reject'
-
+        notifyUsers: 'shubh.bhanushali@g7cr.com'
+        approvers: 'shubh.bhanushali@g7cr.com'
+        instructions: 'Security issues detected. please check validation report in order to cancel or approve the run'
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
   dependsOn: 
