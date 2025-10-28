@@ -563,7 +563,7 @@ stages:
     
     - task: ManualValidation@1
       inputs:
-        notifyUsers: 'shubh.bhanushali@g7cr.com'
+       # notifyUsers: 'shubh.bhanushali@g7cr.com'
         approvers: 'shubh.bhanushali@g7cr.com'
         instructions: 'Security issues or warnings detected. Please check validation report and approve or cancel the run.'
 
