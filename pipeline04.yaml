@@ -283,17 +283,40 @@ stages:
 
           def extract_table_name_from_dml(statement):
               """
-              Extract table name from UPDATE/DELETE statements
+              Extract table name from UPDATE/DELETE statements - FIXED VERSION
               """
-              # Pattern for UPDATE table_name
-              update_match = re.search(r'\bUPDATE\s+(\w+(?:\.\w+)?)\b', statement, re.IGNORECASE)
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              
+              # Pattern for UPDATE table_name - more specific
+              update_match = re.search(r'\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
               if update_match:
                   return update_match.group(1)
               
-              # Pattern for DELETE FROM table_name or DELETE table_name
-              delete_match = re.search(r'\bDELETE\s+(?:FROM\s+)?(\w+(?:\.\w+)?)\b', statement, re.IGNORECASE)
+              # Pattern for DELETE FROM table_name or DELETE table_name - more specific
+              delete_match = re.search(r'\bDELETE\s+(?:FROM\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
               if delete_match:
                   return delete_match.group(1)
+              
+              return None
+
+          def extract_table_name_from_alter(statement):
+              """
+              Extract table name from ALTER TABLE statements - FIXED VERSION
+              """
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              
+              # Pattern for ALTER TABLE - more specific and avoids capturing 'ALTER' as table name
+              alter_match = re.search(r'\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if alter_match:
+                  return alter_match.group(1)
               
               return None
 
@@ -354,23 +377,28 @@ stages:
                   
                   for drop_op, obj_type in dangerous_drops:
                       if drop_op in stmt_upper:
-                          # Extract object name after DROP operation
-                          obj_match = re.search(rf'{drop_op}\s+(\w+(?:\.\w+)?)', stmt_upper, re.IGNORECASE)
-                          obj_info = f" '{obj_match.group(1)}'" if obj_match else ""
+                          # Extract object name after DROP operation - FIXED regex
+                          obj_match = re.search(rf'{re.escape(drop_op)}\\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\\.[a-zA-Z_][a-zA-Z0-9_]*)?)\\b', stmt_upper, re.IGNORECASE)
+                          if obj_match:
+                              obj_info = f" '{obj_match.group(1)}'"
+                          else:
+                              obj_info = ""
                           issues.append(f"Statement {stmt_num}: Dangerous operation - {drop_op}{obj_info}")
                   
                   # Check for TRUNCATE TABLE
                   if 'TRUNCATE TABLE' in stmt_upper or re.search(r'\bTRUNCATE\s+TABLE\b', stmt_upper):
-                      # Extract table name after TRUNCATE TABLE
-                      table_match = re.search(r'TRUNCATE\s+TABLE\s+(\w+(?:\.\w+)?)', stmt_upper, re.IGNORECASE)
-                      table_info = f" '{table_match.group(1)}'" if table_match else ""
+                      # Extract table name after TRUNCATE TABLE - FIXED regex
+                      table_match = re.search(r'TRUNCATE\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', stmt_upper, re.IGNORECASE)
+                      if table_match:
+                          table_info = f" '{table_match.group(1)}'"
+                      else:
+                          table_info = ""
                       issues.append(f"Statement {stmt_num}: TRUNCATE TABLE detected{table_info}")
                   
-                  # Enhanced ALTER TABLE detection
+                  # Enhanced ALTER TABLE detection - FIXED
                   if 'ALTER TABLE' in stmt_upper:
-                      # Extract table name from ALTER TABLE
-                      table_match = re.search(r'ALTER\s+TABLE\s+(\w+(?:\.\w+)?)', stmt_upper, re.IGNORECASE)
-                      table_info = f" '{table_match.group(1)}'" if table_match else ""
+                      table_name = extract_table_name_from_alter(stmt_str)
+                      table_info = f" '{table_name}'" if table_name else ""
                       
                       # Check what type of ALTER operation
                       if re.search(r'\bADD\s+(?!CONSTRAINT)\w+', stmt_upper, re.IGNORECASE):
