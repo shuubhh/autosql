@@ -751,7 +751,9 @@ stages:
                               }
                           }
                           catch {
-                              Write-Warning "  Failed to script $fullName: $($_.Exception.Message)"
+                              # FIX: Capture error message in a variable to avoid PowerShell parser issue with $_ inside $()
+                              $errorMessage = $_.Exception.Message
+                              Write-Warning "  Failed to script $fullName: $errorMessage"
                           }
                       } else {
                           Write-Warning "  Could not find object $fullName. It might not exist (e.g., in a DROP script). Skipping definition backup."
@@ -807,8 +809,10 @@ stages:
                           $tablesCopied++
                       }
                       catch {
+                          # FIX: Capture error message in a variable to avoid PowerShell parser issue with $_ inside $()
+                          $errorMessage = $_.Exception.Message
                           # Log error but continue pipeline. The failure is logged in the backup script itself.
-                          Write-Warning "  Failed to execute copy for $fullName: $($_.Exception.Message)"
+                          Write-Warning "  Failed to execute copy for $fullName: $errorMessage"
                       }
                   }
               }
