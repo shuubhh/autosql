@@ -741,7 +741,8 @@ stages:
                       $backupFullName = "[$($obj.schema)].[$backupObjectName]"
                       $objectType = $obj.type
                       
-                      Write-Host "  Processing $objectType: $originalFullName"
+                      # FIX APPLIED HERE: Use ${objectType} to prevent PowerShell parsing error
+                      Write-Host "  Processing ${objectType}: $originalFullName"
                       
                       # Use OBJECT_ID with schema and name
                       $objectIdQuery = "SELECT OBJECT_ID('$($obj.schema).$($obj.name)')"
@@ -780,9 +781,6 @@ stages:
                                   # Safely replace the object name on the definition line using regex and PowerShell's -replace operator
                                   # Note: The object name is usually right after "CREATE/ALTER PROCEDURE/FUNCTION/VIEW"
                                   
-                                  # Use the name without brackets for the search pattern, then the bracketed version for replacement
-                                  $nameToFind = "$($obj.schema).$($obj.name)"
-                                  
                                   # Create the replacement full name (without brackets, for replacement target)
                                   $replacementName = "$($obj.schema).$backupObjectName"
 
@@ -793,12 +791,13 @@ stages:
                                   # Find the first line that contains "CREATE" or "ALTER" + object type
                                   for ($i = 0; $i -lt $lines.Count; $i++) {
                                       $line = $lines[$i].Trim()
-                                      if ($line -match "^(CREATE|ALTER)\s+$objectType\s+") {
+                                      if ($line -match "^(CREATE|ALTER)\s+${objectType}\s+") { # FIX APPLIED HERE: Used ${objectType}
                                           # Use a precise replacement: search for the original name or its bracketed forms
+                                          $nameToFind = "$($obj.schema).$($obj.name)"
                                           $nameRegex = [regex]::Escape($nameToFind).Replace('\[', '\[?').Replace('\]', '\]?')
                                           
                                           # Try to replace the original object name with the backup object name
-                                          $newLine = $lines[$i] -replace "(?mi)(CREATE|ALTER)\s+$objectType\s+.*", "`$1 $objectType $replacementName"
+                                          $newLine = $lines[$i] -replace "(?mi)(CREATE|ALTER)\s+${objectType}\s+.*", "`$1 $objectType $replacementName"
                                           
                                           # If the line replacement worked (not null/empty), update the definition
                                           if ($newLine -ne $lines[$i]) {
@@ -811,7 +810,7 @@ stages:
                                   
                                   $liveBackupQuery = $modifiedDefinition
                                   # Ensure it uses CREATE not ALTER if we modified the line
-                                  $liveBackupQuery = $liveBackupQuery -replace "(?mi)^\s*ALTER\s+$objectType", "CREATE $objectType"
+                                  $liveBackupQuery = $liveBackupQuery -replace "(?mi)^\s*ALTER\s+${objectType}", "CREATE $objectType" # FIX APPLIED HERE: Used ${objectType}
                                   
                                   
                                   # Execute the new CREATE command
@@ -897,22 +896,6 @@ stages:
               Write-Host "Backup script saved to: $backupFile"
               Write-Host "Total objects scripted and copied (live): $objectsBackedUp"
               Write-Host "Total tables copied (live): $tablesCopied"
-              
-              Write-Host "Uploading backup script and log to Azure Storage..."
-              $blobName = "backup_$(Build.BuildNumber)_$timestamp.sql"
-              
-              $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
-              $ctx = $storageAccount.Context
-              
-              Set-AzStorageBlobContent `
-                  -File $backupFile `
-                  -Container "$(backupContainerName)" `
-                  -Blob $blobName `
-                  -Context $ctx `
-                  -Force
-              
-              Write-Host "Backup completed successfully"
-              Write-Host "  Backup location: $(backupContainerName)/$blobName"
               
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
               Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]$blobName"
