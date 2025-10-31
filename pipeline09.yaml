@@ -31,10 +31,6 @@ variables:
   secretName: 'sql-conn-string'
 
 stages:
-
-# ============================================================
-# Download and Validate Stage
-# ============================================================
 - stage: Download_And_Validate
   displayName: 'Download and Validate SQL Script'
   jobs:
@@ -43,16 +39,17 @@ stages:
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 10
+    
     steps:
     - checkout: none
-
+    
     - task: PowerShell@2
       displayName: 'Verify Agent Prerequisites'
       inputs:
         targetType: 'inline'
         script: |
-          Write-Host "Checking agent prerequisites."
-
+          Write-Host "Checking agent prerequisites..."
+          
           # Check PowerShell version
           $psVersion = $PSVersionTable.PSVersion
           Write-Host "PowerShell Version: $psVersion"
@@ -60,7 +57,7 @@ stages:
               Write-Error "PowerShell 5.0 or higher required"
               exit 1
           }
-
+          
           # Check Python
           try {
               $pythonVersion = python --version 2>&1
@@ -69,35 +66,33 @@ stages:
               # Check if sqlparse is installed
               $sqlparseCheck = python -c "import sqlparse; print('sqlparse is available')" 2>&1
               if ($LASTEXITCODE -ne 0) {
-                  Write-Host "Installing sqlparse module."
+                  Write-Host "Installing sqlparse module..."
                   python -m pip install sqlparse==0.4.4
               } else {
                   Write-Host "✓ sqlparse module is already installed"
               }
           } catch {
               Write-Error "Python not found or not working properly. Please ensure Python 3.x is installed and in PATH"
+              Write-Host "Available Python versions:"
               Get-Command python* -CommandType Application | Format-Table Name, Path
               exit 1
           }
-
+          
           # Check Az PowerShell module
-          $azRequired = @('Az.Accounts','Az.KeyVault','Az.Storage')
-          foreach ($m in $azRequired) {
-              if (-not (Get-Module -ListAvailable -Name $m)) {
-                  Write-Host "Installing $m"
-                  Install-Module -Name $m -Force -AllowClobber -Scope CurrentUser
-              } else {
-                  Write-Host "✓ $m present"
-              }
+          $azModule = Get-Module -ListAvailable -Name Az.Accounts, Az.KeyVault, Az.Storage
+          if (-not $azModule) {
+              Write-Host "Installing Az PowerShell modules..."
+              Install-Module -Name Az.Accounts, Az.KeyVault, Az.Storage -Force -AllowClobber -Scope CurrentUser
           }
-
+          
           # Check SqlServer module
-          if (-not (Get-Module -ListAvailable -Name SqlServer)) {
-              Write-Host "Installing SqlServer PowerShell module."
-              Install-Module -Name SqlServer -Force -Scope CurrentUser
-          } else {
-              Write-Host "✓ SqlServer module present"
+          $sqlModule = Get-Module -ListAvailable -Name SqlServer
+          if (-not $sqlModule) {
+              Write-Host "Installing SqlServer PowerShell module..."
+              Install-Module -Name SqlServer -Force -AllowClobber -Scope CurrentUser
           }
+          
+          Write-Host "✓ Prerequisites verified"
 
     - task: AzurePowerShell@5
       displayName: 'Download SQL Script from Blob'
@@ -107,33 +102,40 @@ stages:
         azurePowerShellVersion: 'LatestVersion'
         Inline: |
           $ErrorActionPreference = "Stop"
+          
           try {
-              Write-Host "Preparing download path..."
+              Write-Host "Creating directory structure..."
               New-Item -ItemType Directory -Force -Path "$(Pipeline.Workspace)/sql" | Out-Null
-
-              Write-Host "Finding storage account $(storageAccountName)"
+              
+              Write-Host "Downloading script: ${{ parameters.sqlScriptName }}"
+              
+              # Get storage account context
               $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
+              
               if (-not $storageAccount) {
                   throw "Storage account '$(storageAccountName)' not found"
               }
+              
               $ctx = $storageAccount.Context
-
-              Write-Host "Downloading script: ${{ parameters.sqlScriptName }}"
+              
+              # Download blob
               Get-AzStorageBlobContent `
-                -Container "$(containerName)" `
-                -Blob "${{ parameters.sqlScriptName }}" `
-                -Destination "$(sqlScriptPath)" `
-                -Context $ctx `
-                -Force
-
+                  -Container "$(containerName)" `
+                  -Blob "${{ parameters.sqlScriptName }}" `
+                  -Destination "$(sqlScriptPath)" `
+                  -Context $ctx `
+                  -Force
+              
               if (-not (Test-Path "$(sqlScriptPath)")) {
-                  throw "Failed to download SQL script to $(sqlScriptPath)"
+                  throw "Failed to download SQL script"
               }
-
+              
               $fileSize = (Get-Item "$(sqlScriptPath)").Length
               Write-Host "✓ Script downloaded successfully ($fileSize bytes)"
-              Get-Content "$(sqlScriptPath)" -TotalCount 8 | ForEach-Object { Write-Host "  $_" }
-          } catch {
+              Write-Host "Script location: $(sqlScriptPath)"
+              Get-Content "$(sqlScriptPath)" -TotalCount 5 | ForEach-Object { Write-Host "  $_" }
+          }
+          catch {
               Write-Error "Download failed: $($_.Exception.Message)"
               exit 1
           }
@@ -151,9 +153,10 @@ stages:
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 15
+    
     steps:
     - checkout: none
-
+    
     - task: DownloadPipelineArtifact@2
       displayName: 'Download SQL Script Artifact'
       inputs:
@@ -172,105 +175,430 @@ stages:
           import re
           import json
 
-          # Debug info
+          # Debug: Print environment variables and check paths
           print("=== DEBUG INFORMATION ===")
-          print("PIPELINE_WORKSPACE:", os.environ.get('PIPELINE_WORKSPACE'))
-          print("SQL_SCRIPT_PATH:", os.environ.get('SQL_SCRIPT_PATH'))
+          print("Environment Variables:")
+          for key, value in sorted(os.environ.items()):
+              if any(term in key for term in ['WORK', 'AGENT', 'PIPELINE', 'BUILD', 'SCRIPT', 'SYSTEM']):
+                  print(f"  {key}: {value}")
 
-          pipeline_workspace = os.environ.get('PIPELINE_WORKSPACE') or os.environ.get('SYSTEM_DEFAULTWORKINGDIRECTORY') or os.getcwd()
-          script_path = os.environ.get('SQL_SCRIPT_PATH')
-          if not script_path:
-              script_path = os.path.join(pipeline_workspace, 'sql', os.environ.get('SQL_SCRIPT_NAME_PARAM', 'script.sql'))
+          # Get paths from environment variables
+          pipeline_workspace = os.environ.get('PIPELINE_WORKSPACE')
+          sql_script_path = os.environ.get('SQL_SCRIPT_PATH')
 
-          print("Using script path:", script_path)
-          if not os.path.exists(script_path):
-              print("##vso[task.logissue type=error]SQL script not found at " + script_path)
+          print(f"\nPipeline Workspace from env: {pipeline_workspace}")
+          print(f"SQL Script Path from env: {sql_script_path}")
+
+          # If environment variables are not set, try alternative approaches
+          if not pipeline_workspace:
+              print("PIPELINE_WORKSPACE not found in environment, trying alternatives...")
+              possible_workspaces = [
+                  os.environ.get('AGENT_WORKFOLDER'),
+                  os.environ.get('SYSTEM_DEFAULTWORKINGDIRECTORY'),
+                  os.path.abspath('.')
+              ]
+              for workspace in possible_workspaces:
+                  if workspace and os.path.exists(workspace):
+                      pipeline_workspace = workspace
+                      print(f"Using alternative workspace: {pipeline_workspace}")
+                      break
+
+          if not sql_script_path:
+              print("SQL_SCRIPT_PATH not found in environment, constructing path...")
+              if pipeline_workspace:
+                  sql_script_path = os.path.join(pipeline_workspace, 'sql', os.path.basename(os.environ.get('SQL_SCRIPT_NAME_PARAM', 'script.sql')))
+                  print(f"Constructed script path: {sql_script_path}")
+
+          # Normalize paths
+          if pipeline_workspace:
+              report_dir = os.path.join(pipeline_workspace, 'sql')
+          else:
+              report_dir = 'sql'  # Fallback
+              
+          script_path = sql_script_path
+
+          print(f"\nFinal Paths:")
+          print(f"Report Directory: {report_dir}")
+          print(f"Script Path: {script_path}")
+
+          # Check if script file exists
+          print(f"\nFile Check:")
+          print(f"Script exists: {os.path.exists(script_path) if script_path else 'No path'}")
+          if script_path and os.path.exists(script_path):
+              print(f"Script size: {os.path.getsize(script_path)} bytes")
+              # Show first few lines of the script
+              try:
+                  with open(script_path, 'r', encoding='utf-8') as f:
+                      first_lines = []
+                      for _ in range(5):
+                          line = f.readline()
+                          if not line:
+                              break
+                          first_lines.append(line.strip())
+                  print(f"First lines: {first_lines}")
+              except Exception as e:
+                  print(f"Error reading script: {e}")
+          else:
+              # List files in possible locations
+              print("Searching for SQL files...")
+              search_dirs = [pipeline_workspace, 'sql', '.', os.path.join(pipeline_workspace, 'sql') if pipeline_workspace else 'sql']
+              for search_dir in search_dirs:
+                  if search_dir and os.path.exists(search_dir):
+                      print(f"Files in {search_dir}:")
+                      try:
+                          for file in os.listdir(search_dir):
+                              if file.endswith('.sql'):
+                                  print(f"  - {file}")
+                      except Exception as e:
+                          print(f"  Error listing: {e}")
+
+          print("=== END DEBUG ===\n")
+
+          # Validate that we have a script path
+          if not script_path or not os.path.exists(script_path):
+              print("##vso[task.logissue type=error]SQL script not found")
+              print(f"##vso[task.logissue type=error]Expected path: {script_path}")
               sys.exit(1)
 
           def validate_sql_syntax(file_path):
-              with open(file_path, 'r', encoding='utf-8') as f:
-                  sql_content = f.read()
-              if not sql_content.strip():
-                  print("##vso[task.logissue type=error]SQL file is empty")
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      sql_content = f.read()
+                  
+                  if not sql_content.strip():
+                      print("##vso[task.logissue type=error]SQL file is empty")
+                      return False
+                  
+                  parsed = sqlparse.parse(sql_content)
+                  if not parsed:
+                      print("##vso[task.logissue type=error]Failed to parse SQL content")
+                      return False
+                  
+                  print("Basic SQL syntax is valid")
+                  print(f"  Found {len(parsed)} SQL statement(s)")
+                  return True
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]SQL Syntax Error: {e}")
                   return False
-              parsed = sqlparse.parse(sql_content)
-              if not parsed:
-                  print("##vso[task.logissue type=error]Failed to parse SQL content")
-                  return False
-              print("Basic SQL syntax parse OK - statements found:", len(parsed))
-              return True
 
-          def extract_affected_objects(file_path):
-              with open(file_path, 'r', encoding='utf-8') as f:
-                  sql_content = f.read()
+          def extract_table_name_from_dml(statement):
+              """
+              Extract table name from UPDATE/DELETE statements - FIXED VERSION
+              """
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              
+              # Pattern for UPDATE table_name - more specific
+              update_match = re.search(r'\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if update_match:
+                  return update_match.group(1)
+              
+              # Pattern for DELETE FROM table_name or DELETE table_name - more specific
+              delete_match = re.search(r'\bDELETE\s+(?:FROM\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if delete_match:
+                  return delete_match.group(1)
+              
+              return None
 
-              # Remove comments
-              sql_no_comments = re.sub(r'--.*$', '', sql_content, flags=re.MULTILINE)
-              sql_no_comments = re.sub(r'/\*.*?\*/', '', sql_no_comments, flags=re.DOTALL)
-
-              procedures = re.findall(r'\b(?:ALTER|DROP)\s+PROCEDURE\s+([^\s;]+)', sql_no_comments, flags=re.IGNORECASE)
-              functions = re.findall(r'\b(?:ALTER|DROP)\s+FUNCTION\s+([^\s;]+)', sql_no_comments, flags=re.IGNORECASE)
-              views = re.findall(r'\b(?:ALTER|DROP)\s+VIEW\s+([^\s;]+)', sql_no_comments, flags=re.IGNORECASE)
-              tables = re.findall(r'\b(?:ALTER|DROP)\s+TABLE\s+([^\s;]+)', sql_no_comments, flags=re.IGNORECASE)
-
-              data = {
-                  "procedures": procedures,
-                  "functions": functions,
-                  "views": views,
-                  "tables": tables
-              }
-              return data
+          def extract_table_name_from_alter(statement):
+              """
+              Extract table name from ALTER TABLE statements - FIXED VERSION
+              """
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
+              
+              # Pattern for ALTER TABLE - more specific and avoids capturing 'ALTER' as table name
+              alter_match = re.search(r'\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if alter_match:
+                  return alter_match.group(1)
+              
+              return None
 
           def check_security_policies(file_path):
               with open(file_path, 'r', encoding='utf-8') as f:
                   sql_content = f.read()
+              
               issues = []
               warnings = []
-
+              
               statements = sqlparse.parse(sql_content)
+              
               for i, stmt in enumerate(statements):
-                  s = str(stmt).upper()
-                  # Basic dangerous checks simplified
-                  if 'DELETE' in s and 'WHERE' not in s:
-                      issues.append(f"Statement {i+1}: DELETE without WHERE")
-                  if 'TRUNCATE TABLE' in s:
-                      issues.append(f"Statement {i+1}: TRUNCATE TABLE")
-                  if re.search(r'\bDROP\s+TABLE\b', s):
-                      issues.append(f"Statement {i+1}: DROP TABLE detected")
-                  if 'EXEC(' in s or 'SP_EXECUTESQL' in s:
-                      warnings.append(f"Statement {i+1}: Dynamic SQL detected")
+                  stmt_str = str(stmt).strip()
+                  if not stmt_str:
+                      continue
+                  
+                  stmt_upper = stmt_str.upper()
+                  stmt_num = i + 1
+                  
+                  # Check for UPDATE without WHERE clause in any SQL statement
+                  if 'UPDATE' in stmt_upper:
+                      # Remove comments and strings to avoid false positives
+                      clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
+                      clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+                      clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
+                      
+                      # Check if UPDATE has WHERE clause
+                      if 'UPDATE' in clean_stmt and 'WHERE' not in clean_stmt:
+                          table_name = extract_table_name_from_dml(stmt_str)
+                          table_info = f" on table '{table_name}'" if table_name else ""
+                          issues.append(f"Statement {stmt_num}: UPDATE without WHERE clause{table_info}")
+                  
+                  # Check for DELETE without WHERE clause in any SQL statement
+                  if 'DELETE' in stmt_upper:
+                      # Remove comments and strings to avoid false positives
+                      clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
+                      clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+                      clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
+                      
+                      # Check if DELETE has WHERE clause
+                      if 'DELETE' in clean_stmt and 'WHERE' not in clean_stmt:
+                          table_name = extract_table_name_from_dml(stmt_str)
+                          table_info = f" on table '{table_name}'" if table_name else ""
+                          issues.append(f"Statement {stmt_num}: DELETE without WHERE clause{table_info}")
+                  
+                  # Check for dangerous DROP operations with enhanced pattern matching
+                  dangerous_drops = [
+                      ('DROP TABLE', 'TABLE'),
+                      ('DROP DATABASE', 'DATABASE'), 
+                      ('DROP SCHEMA', 'SCHEMA'),
+                      ('DROP PROCEDURE', 'PROCEDURE'),
+                      ('DROP FUNCTION', 'FUNCTION'),
+                      ('DROP VIEW', 'VIEW')
+                  ]
+                  
+                  for drop_op, obj_type in dangerous_drops:
+                      if drop_op in stmt_upper:
+                          # Extract object name after DROP operation - FIXED regex
+                          obj_match = re.search(rf'{re.escape(drop_op)}\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', stmt_upper, re.IGNORECASE)
+                          if obj_match:
+                              obj_info = f" '{obj_match.group(1)}'"
+                          else:
+                              obj_info = ""
+                          issues.append(f"Statement {stmt_num}: Dangerous operation - {drop_op}{obj_info}")
+                  
+                  # Check for TRUNCATE TABLE
+                  if 'TRUNCATE TABLE' in stmt_upper or re.search(r'\bTRUNCATE\s+TABLE\b', stmt_upper):
+                      # Extract table name after TRUNCATE TABLE - FIXED regex
+                      table_match = re.search(r'TRUNCATE\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', stmt_upper, re.IGNORECASE)
+                      if table_match:
+                          table_info = f" '{table_match.group(1)}'"
+                      else:
+                          table_info = ""
+                      issues.append(f"Statement {stmt_num}: TRUNCATE TABLE detected{table_info}")
+                  
+                  # Enhanced ALTER TABLE detection - FIXED to trigger approval
+                  if 'ALTER TABLE' in stmt_upper:
+                      table_name = extract_table_name_from_alter(stmt_str)
+                      table_info = f" '{table_name}'" if table_name else ""
+                      
+                      # Check what type of ALTER operation - ALL marked as ISSUES to trigger approval
+                      if re.search(r'\bADD\s+(?!CONSTRAINT)\w+', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE ADD COLUMN operation{table_info}")
+                      elif re.search(r'\bDROP\s+COLUMN\b', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE DROP COLUMN operation{table_info}")
+                      elif re.search(r'\bALTER\s+COLUMN\b', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE MODIFY COLUMN operation{table_info}")
+                      else:
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE operation{table_info}")
+                  
+                  # Check for ALTER PROCEDURE/FUNCTION/VIEW - trigger approval
+                  if re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\b', stmt_upper, re.IGNORECASE):
+                      match = re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\s+([a-zA-Z_\[\]\.][a-zA-Z0-9_\[\]\.]*)', stmt_upper, re.IGNORECASE)
+                      if match:
+                          obj_type = match.group(1)
+                          obj_name = match.group(2)
+                          issues.append(f"Statement {stmt_num}: ALTER {obj_type} operation '{obj_name}'")
+                  
+                  # Check for Dynamic SQL (warning only)
+                  if re.search(r'\bEXEC\s*\(|\bEXECUTE\s*\(|\bSP_EXECUTESQL\b', stmt_upper):
+                      warnings.append(f"Statement {stmt_num}: Dynamic SQL detected")
+              
               return issues, warnings
+
+          # *** UPDATED FUNCTION ***
+          # Now detects BOTH DROP and ALTER statements for backup
+          def extract_affected_objects(file_path):
+              with open(file_path, 'r', encoding='utf-8') as f:
+                  sql_content = f.read()
+
+              # Remove comments to avoid false positives
+              sql_content = re.sub(r'--.*$', '', sql_content, flags=re.MULTILINE)
+              sql_content = re.sub(r'/\*.*?\*/', '', sql_content, flags=re.DOTALL)
+              
+              objects_to_backup = []
+              
+              # *** UPDATED REGEX *** - Now matches BOTH ALTER and DROP
+              # Regex to find ALTER or DROP commands for procedures, functions, views, or tables
+              # Group 1: ALTER or DROP
+              # Group 2: PROCEDURE, FUNCTION, VIEW, TABLE
+              # Group 3: Object name (e.g., [dbo].[myProc], dbo.myProc, [myProc], myProc)
+              pattern = re.compile(
+                  r'\b(ALTER|DROP)\s+(PROCEDURE|FUNCTION|VIEW|TABLE)\s+((?:\[[^\]]+\]|[\w\d_]+)\.(?:\[[^\]]+\]|[\w\d_]+)|(?:\[[^\]]+\]|[\w\d_]+))',
+                  re.IGNORECASE | re.MULTILINE
+              )
+              
+              # Keep track of unique objects to avoid duplicates
+              unique_objects = set()
+
+              for match in pattern.finditer(sql_content):
+                  action = match.group(1).upper()  # Now captures 'ALTER' or 'DROP'
+                  obj_type = match.group(2).upper()
+                  full_name = match.group(3)
+                  
+                  # Parse schema and name
+                  schema = 'dbo' # Default schema
+                  name = full_name
+                  
+                  if '.' in full_name:
+                      parts = full_name.split('.')
+                      # Handle [schema].[object]
+                      schema = parts[0].strip().strip('[]')
+                      name = '.'.join(parts[1:]).strip().strip('[]') # Handle names with dots if any (unlikely but safe)
+                  else:
+                      name = full_name.strip().strip('[]')
+                  
+                  # Create a unique key for this object
+                  obj_key = (schema.lower(), name.lower(), obj_type)
+                  
+                  if obj_key not in unique_objects:
+                      objects_to_backup.append({
+                          'schema': schema,
+                          'name': name,
+                          'type': obj_type,
+                          'action': action  # Now includes whether it's ALTER or DROP
+                      })
+                      unique_objects.add(obj_key)
+              
+              # Separate scriptable objects (proc, func, view) from tables
+              scriptable_objects = [obj for obj in objects_to_backup if obj['type'] in ('PROCEDURE', 'FUNCTION', 'VIEW')]
+              table_objects = [obj for obj in objects_to_backup if obj['type'] == 'TABLE']
+
+              # This is for the human-readable text report
+              affected_report = {
+                  'procedures': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'PROCEDURE'])),
+                  'functions': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'FUNCTION'])),
+                  'views': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'VIEW'])),
+                  'tables': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in table_objects]))
+              }
+
+              # This is the JSON data that will be used by the backup stage
+              backup_data = {
+                  'scriptableObjects': scriptable_objects,
+                  'tableObjects': table_objects
+              }
+              
+              return backup_data, affected_report
+
+          # *** MODIFIED FUNCTION ***
+          # Now saves the correct JSON for the backup stage
+          def generate_report(file_path, syntax_ok, issues, warnings, affected_report_data, backup_json_data, report_dir):
+              # Use the report_dir we defined earlier
+              os.makedirs(report_dir, exist_ok=True)
+              report_path = os.path.join(report_dir, 'validation_report.txt')
+              
+              # Use UTF-8 encoding to handle special characters
+              with open(report_path, 'w', encoding='utf-8') as f:
+                  f.write("=" * 70 + "\n")
+                  f.write("SQL VALIDATION REPORT\n")
+                  f.write("=" * 70 + "\n\n")
+                  f.write(f"Script: {os.path.basename(file_path)}\n")
+                  f.write(f"Syntax Valid: {'YES' if syntax_ok else 'NO'}\n\n")
+                  
+                  # Use the affected_report_data for the text report
+                  affected = affected_report_data
+                  if any(affected.values()):
+                      f.write("AFFECTED DATABASE OBJECTS (from ALTER or DROP):\n")
+                      f.write("-" * 70 + "\n")
+                      if affected['procedures']:
+                          f.write(f"  Procedures: {', '.join(set(affected['procedures']))}\n")
+                      if affected['functions']:
+                          f.write(f"  Functions: {', '.join(set(affected['functions']))}\n")
+                      if affected['views']:
+                          f.write(f"  Views: {', '.join(set(affected['views']))}\n")
+                      if affected['tables']:
+                          f.write(f"  Tables: {', '.join(set(affected['tables']))}\n")
+                      f.write("\n")
+                  else:
+                      f.write("No objects identified for backup (ALTER/DROP statements not found)\n\n")
+                  
+                  if issues:
+                      f.write(f"CRITICAL ISSUES ({len(issues)}):\n")
+                      f.write("-" * 70 + "\n")
+                      for issue in issues:
+                          f.write(f"  [ISSUE] {issue}\n")
+                      f.write("\n")
+                  
+                  if warnings:
+                      f.write(f"WARNINGS ({len(warnings)}):\n")
+                      f.write("-" * 70 + "\n")
+                      for warning in warnings:
+                          f.write(f"  [WARNING] {warning}\n")
+                      f.write("\n")
+                  
+                  if not issues and not warnings:
+                      f.write("No security issues detected\n\n")
+                  
+                  f.write("=" * 70 + "\n")
+              
+              # Save the backup_json_data to affected_objects.json for the next stage
+              affected_path = os.path.join(report_dir, 'affected_objects.json')
+              with open(affected_path, 'w', encoding='utf-8') as f:
+                  # This is the new structure
+                  json.dump(backup_json_data, f, indent=2)
+              
+              print(f"Validation report generated: {report_path}")
+              print(f"Affected objects JSON saved: {affected_path}")
+
+          # --- MAIN EXECUTION ---
+          print(f"Validating SQL script: {script_path}\n")
 
           syntax_ok = validate_sql_syntax(script_path)
           issues, warnings = check_security_policies(script_path)
-          affected = extract_affected_objects(script_path)
+          
+          # Updated function now returns two values
+          backup_data, affected_report = extract_affected_objects(script_path)
 
-          report_dir = os.path.join(pipeline_workspace, 'sql')
-          os.makedirs(report_dir, exist_ok=True)
-          report_path = os.path.join(report_dir, 'validation_report.txt')
-          with open(report_path, 'w', encoding='utf-8') as r:
-              r.write("Validation report\n\n")
-              r.write("Affected objects:\n")
-              r.write(json.dumps(affected, indent=2))
-              r.write("\n\nIssues:\n")
-              r.write("\n".join(issues))
-              r.write("\n\nWarnings:\n")
-              r.write("\n".join(warnings))
-
-          # Save affected objects for backup stage
-          affected_json = os.path.join(report_dir, 'affected_objects.json')
-          with open(affected_json, 'w', encoding='utf-8') as f:
-              json.dump(affected, f, indent=2)
+          # Pass all data to the report function
+          generate_report(script_path, syntax_ok, issues, warnings, affected_report, backup_data, report_dir)
 
           if issues:
-              print("##vso[task.logissue type=error]Security issues found:", issues)
-              print("##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true")
-              print("##vso[task.setvariable variable=hasWarnings;isOutput=true]true")
+              print("\n" + "=" * 70)
+              print(f"CRITICAL ISSUES FOUND ({len(issues)}):")
+              print("=" * 70)
+              for issue in issues:
+                  print(f"  {issue}")
+                  print(f"##vso[task.logissue type=error]{issue}")
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true')
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]true')
           else:
-              print("No critical security issues found")
-              print("##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]false")
-              print("##vso[task.setvariable variable=hasWarnings;isOutput=true]{}".format("true" if warnings else "false"))
+              print("\nNo critical security issues found")
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]false')
+          
+          if warnings:
+              print("\n" + "=" * 70)
+              print(f"WARNINGS ({len(warnings)}):\n")
+              print("=" * 70)
+              for warning in warnings:
+                  print(f"  {warning}")
+                  print(f"##vso[task.logissue type=warning]{warning}")
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]true')
+          else:
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]false')
 
+          if not syntax_ok:
+              print("\n##vso[task.complete result=Failed;]Syntax validation failed")
+              sys.exit(1)
+
+          print("\nValidation completed successfully")
       env:
         PIPELINE_WORKSPACE: $(Pipeline.Workspace)
         SQL_SCRIPT_PATH: $(sqlScriptPath)
@@ -284,9 +612,6 @@ stages:
         artifact: 'ValidationReport'
         publishLocation: 'pipeline'
 
-# ============================================================
-# Security Review (Manual Approval) Stage
-# ============================================================
 - stage: Security_Review
   displayName: 'Security Review Required'
   dependsOn: Download_And_Validate
@@ -298,26 +623,25 @@ stages:
         eq(dependencies.Download_And_Validate.outputs['ValidateScript.SQLValidation.hasWarnings'], 'true')
       )
     )
-
+  
   jobs:
   - job: WaitForApproval
     displayName: 'Manual Security Approval'
     pool: server
     timeoutInMinutes: 1440
+    
     steps:
+    
     - task: ManualValidation@1
       inputs:
         notifyUsers: 'shubh.bhanushali@g7cr.com'
         approvers: 'shubh.bhanushali@g7cr.com'
-        instructions: 'Issues found with the SQL script. Please check the validation file and approve/reject.'
+        instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
         onTimeout: 'reject'
 
-# ============================================================
-# Backup Affected Database Objects Stage
-# ============================================================
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
-  dependsOn:
+  dependsOn: 
     - Download_And_Validate
     - Security_Review
   condition: |
@@ -327,16 +651,17 @@ stages:
       eq('${{ parameters.enableBackup }}', 'true'),
       eq('${{ parameters.dryRun }}', 'false')
     )
-
+  
   jobs:
   - job: CreateBackup
     displayName: 'Backup Affected Database Objects'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 30
+    
     steps:
     - checkout: none
-
+    
     - task: DownloadPipelineArtifact@2
       displayName: 'Download Validation Results'
       inputs:
@@ -352,115 +677,234 @@ stages:
         azurePowerShellVersion: 'LatestVersion'
         Inline: |
           $ErrorActionPreference = "Stop"
+          
+          # Helper function to escape object names for regex replacement
+          function Escape-SqlName {
+              param([string]$name)
+              # Escapes special characters in the name and handles brackets [ ]
+              return [regex]::Escape($name).Replace('\\[', '[').Replace('\\]', ']').Replace('\\.', '.')
+          }
+          
           try {
               Write-Host "Retrieving connection string from Key Vault..."
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
+              
               if ([string]::IsNullOrEmpty($connectionString)) {
                   throw "Failed to retrieve connection string from Key Vault"
               }
-
+              
+              Write-Host "Reading affected objects list..."
+              $affectedObjectsPath = "$(Pipeline.Workspace)/sql/affected_objects.json"
               $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-              New-Item -ItemType Directory -Force -Path "$(backupPath)" | Out-Null
               $backupFile = "$(backupPath)/backup_$timestamp.sql"
-
-              $affectedFile = "$(Pipeline.Workspace)/sql/affected_objects.json"
-              $scriptArtifact = Get-ChildItem -Path "$(Pipeline.Workspace)/sql" -Filter *.sql -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($scriptArtifact) {
-                  $scriptPath = $scriptArtifact.FullName
-              } else {
-                  $scriptPath = "$(sqlScriptPath)"
+              
+              if (-not (Test-Path $affectedObjectsPath)) {
+                  Write-Host "No 'affected_objects.json' file found. No objects to back up."
+                  Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
+                  Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]none"
+                  Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]0"
+                  exit 0
               }
+              
+              $affectedData = Get-Content $affectedObjectsPath | ConvertFrom-Json
+              $scriptableObjects = $affectedData.scriptableObjects
+              $tableObjects = $affectedData.tableObjects
+              
+              # *** UPDATED LOGIC *** - Now processes both ALTER and DROP statements
+              $totalObjects = $scriptableObjects.Count + $tableObjects.Count
+              if ($totalObjects -eq 0) {
+                  Write-Host "No objects marked for ALTER or DROP. No backup needed."
+                  Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
+                  Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]none"
+                  Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]0"
+                  exit 0
+              }
+              
+              Write-Host "Found $($scriptableObjects.Count) scriptable object(s) and $($tableObjects.Count) table(s) for backup processing"
+              Write-Host "Actions detected:"
+              foreach ($obj in $scriptableObjects) {
+                  Write-Host "  - $($obj.type) $($obj.schema).$($obj.name): $($obj.action)"
+              }
+              foreach ($obj in $tableObjects) {
+                  Write-Host "  - $($obj.type) $($obj.schema).$($obj.name): $($obj.action)"
+              }
+              
+              New-Item -ItemType Directory -Force -Path '$(backupPath)' | Out-Null
+              
+              $backupScriptContent = "-- ============================================================`r`n"
+              $backupScriptContent += "-- DATABASE BACKUP SCRIPT (AFFECTED OBJECTS ONLY)`r`n"
+              $backupScriptContent += "-- ============================================================`r`n"
+              $backupScriptContent += "-- Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
+              $backupScriptContent += "-- Build: $(Build.BuildNumber)`r`n"
+              $backupScriptContent += "-- Original Script: ${{ parameters.sqlScriptName }}`r`n"
+              $backupScriptContent += "-- Backs up definitions for objects targeted by ALTER/DROP`r`n"
+              $backupScriptContent += "-- ============================================================`r`n`r`n"
+              
+              $objectsBackedUp = 0
+              $tablesCopied = 0
+              
+              # --------------------------------------------------------------------------
+              # 1. Backup definitions AND create backup objects for Procs, Funcs, Views
+              # *** UPDATED *** - Now processes both ALTER and DROP statements
+              # --------------------------------------------------------------------------
+              if ($scriptableObjects.Count -gt 0) {
+                  Write-Host "Backing up definitions and creating live backup objects for $($scriptableObjects.Count) scriptable object(s)..."
+                  $backupScriptContent += "`r`n-- ========================================`r`n"
+                  $backupScriptContent += "-- SCRIPTED OBJECT DEFINITIONS & LIVE BACKUPS (PROCEDURE, FUNCTION, VIEW)`r`n"
+                  $backupScriptContent += "-- Actions: $((($scriptableObjects | ForEach-Object { $_.action }) -join ', '))`r`n"
+                  $backupScriptContent += "-- ========================================`r`n`r`n"
+          
+                  foreach ($obj in $scriptableObjects) {
+                      $originalFullName = "[$($obj.schema)].[$($obj.name)]"
+                      $backupObjectName = "$($obj.name)_backup_$timestamp"
+                      $backupFullName = "[$($obj.schema)].[$backupObjectName]"
+                      $objectType = $obj.type
+                      $action = $obj.action  # Now we know if it's ALTER or DROP
+                      
+                      Write-Host "  Processing $action on ${objectType}: $originalFullName"
+                      
+                      # Use OBJECT_ID with schema and name
+                      $objectIdQuery = "SELECT OBJECT_ID('$($obj.schema).$($obj.name)')"
+                      $objId = Invoke-Sqlcmd -ConnectionString $connectionString -Query $objectIdQuery -ErrorAction SilentlyContinue
+                      
+                      if ($objId -and $objId.Item(0) -ne $null) {
+                          $query = "SELECT OBJECT_DEFINITION($($objId.Item(0))) AS Definition"
+                          try {
+                              $result = Invoke-Sqlcmd -ConnectionString $connectionString -Query $query -MaxCharLength 65535 -ErrorAction Stop
+                              
+                              if ($result -and $result.Definition) {
+                                  $definition = $result.Definition
+                                  
+                                  # Add definition to the artifact script (as before)
+                                  $backupScriptContent += "-- Object Definition: $originalFullName ($objectType) - Action: $action`r`n"
+                                  $backupScriptContent += $definition + "`r`n"
+                                  $backupScriptContent += "GO`r`n`r`n"
+                                  
+                                  # --------------------------------------------------------
+                                  # NEW LOGIC: Create the live backup object in the database
+                                  # *** FIXED *** - Remove GO statements and handle batch execution properly
+                                  # --------------------------------------------------------
+                                  Write-Host "    Attempting to create live backup object: $backupFullName"
 
-              Write-Host "Using script at: $scriptPath"
-              if (-not (Test-Path $scriptPath)) {
-                  Write-Warning "Script not found, skipping live backup creation"
-              } else {
-                  # Read original script and remove NBSP and GO tokens
-                  $orig = Get-Content -Path $scriptPath -Raw -ErrorAction Stop
-                  $orig = $orig.Replace([char]0x00A0, [char]0x0020)
-                  $origNoGo = $orig -replace '(?mi)^\s*GO\s*$',''  # remove standalone GO lines
+                                  # 1. Clean up potential existing backup (safety check) - execute separately
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
 
-                  # Find ALTER/DROP PROCEDURE blocks using regex simple heuristic
-                  $procMatches = [regex]::Matches($origNoGo, '(?si)(ALTER|CREATE)\s+PROCEDURE\s+([^\r\n\(]+)\s*(\([^\)]*\))?.*?(?=(?:\r?\nCREATE|\r?\nALTER|\z))')
-
-                  if ($procMatches.Count -gt 0) {
-                      foreach ($m in $procMatches) {
-                          # m.Groups[2] contains object name (may include schema)
-                          $procNameRaw = $m.Groups[2].Value.Trim()
-                          # normalize name (remove brackets if any)
-                          $procNameClean = $procNameRaw -replace '^\[|\]$',''
-                          # create backup name
-                          $backupName = ($procNameClean -replace '[\[\]\.]','_') + "_backup_$timestamp"
-                          # Build CREATE script for backup
-                          $defBlock = $m.Value.Trim()
-                          # Replace ALTER with CREATE for backup safety
-                          $defBlock = $defBlock -replace '(?i)^\s*ALTER\s+PROCEDURE', 'CREATE PROCEDURE'
-                          # Ensure CREATE line references backup name with schema preserved if present
-                          if ($procNameClean -match '\.') {
-                              $schema, $short = $procNameClean.Split('.',2)
-                              $createLine = "CREATE PROCEDURE [$schema].[$backupName]"
-                          } else {
-                              $createLine = "CREATE PROCEDURE dbo.[$backupName]"
-                          }
-                          # Replace object's first CREATE/ALTER line
-                          $defLines = $defBlock -split "`r?`n"
-                          for ($i=0; $i -lt $defLines.Count; $i++) {
-                              if ($defLines[$i] -match '^\s*(ALTER|CREATE)\s+PROCEDURE') {
-                                  # Replace that line with new create line while preserving parameter list if on same line
-                                  $rest = $defLines[$i] -replace '^\s*(ALTER|CREATE)\s+PROCEDURE\s+([^\r\n]*)', ''
-                                  if ($rest) {
-                                      $defLines[$i] = $createLine + " " + $rest.Trim()
-                                  } else {
-                                      $defLines[$i] = $createLine
+                                  # 2. Modify the Definition Script to use the backup name
+                                  # Split definition into lines to find the object declaration line
+                                  $lines = $definition -split "`r`n"
+                                  
+                                  # Find and replace the CREATE/ALTER line with the backup name
+                                  for ($i = 0; $i -lt $lines.Count; $i++) {
+                                      if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
+                                          $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE`$2$backupFullName"
+                                          break
+                                      }
                                   }
-                                  # drop previous lines so CREATE is first in the batch
-                                  $defLines = $defLines[$i..($defLines.Count-1)]
-                                  break
+                                  
+                                  $liveBackupQuery = $lines -join "`r`n"
+                                  
+                                  # Remove any GO statements from the query for procedure/function creation
+                                  # since CREATE PROCEDURE/FUNCTION must be the first statement in batch
+                                  $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
+                                  
+                                  # Execute the CREATE command in its own batch
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
+                                  Write-Host "    ✓ Live backup object created: $backupFullName"
+                                  $objectsBackedUp++
+                              } else {
+                                  Write-Warning "  Could not script definition for $originalFullName."
                               }
                           }
-                          $finalCreate = ($defLines -join "`r`n").Trim()
-                          # remove any GO tokens inside finalCreate
-                          $finalCreate = $finalCreate -replace '(?i)\bGO\b',''
-
-                          # Attempt to drop existing backup proc if exists (safe cleanup)
-                          $dropSql = "IF OBJECT_ID(N'$createLine','P') IS NOT NULL DROP PROCEDURE $createLine;"
-                          # NOTE: $createLine includes schema and square brackets, but we will drop specific backup name below using fully-qualified name
-                          try {
-                              $fullyQualifiedBackup = if ($procNameClean -match '\.') { ("[" + $procNameClean.Split('.')[0] + "].[" + $backupName + "]") } else { ("[dbo].[" + $backupName + "]") }
-                              $dropBackup = "IF OBJECT_ID(N'$fullyQualifiedBackup','P') IS NOT NULL DROP PROCEDURE $fullyQualifiedBackup;"
-                              Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackup -ErrorAction SilentlyContinue
-                          } catch {
-                              # ignore drop errors
+                          catch {
+                              $errorMessage = $_.Exception.Message
+                              Write-Warning "  Failed to script or create live backup for ${originalFullName}: ${errorMessage}"
                           }
-
-                          try {
-                              Write-Host "Creating live backup object: $fullyQualifiedBackup"
-                              Invoke-Sqlcmd -ConnectionString $connectionString -Query $finalCreate -QueryTimeout 300 -ErrorAction Stop
-                              Write-Host "  ✓ Live backup created: $fullyQualifiedBackup"
-                          } catch {
-                              Write-Warning "  Failed to create live backup for $procNameClean: $($_.Exception.Message)"
-                          }
-
-                          # Append original definition to backup file artifact for record
-                          Add-Content -Path $backupFile -Value ("-- Backup for " + $procNameClean + " created at " + (Get-Date).ToString("s"))
-                          Add-Content -Path $backupFile -Value $m.Value
-                          Add-Content -Path $backupFile -Value "`r`nGO`r`n"
+                      } else {
+                          Write-Warning "  Could not find object $originalFullName. Skipping definition and live backup."
                       }
-                  } else {
-                      Write-Host "No procedure definitions detected for live backup creation."
-                      # Still save the original script as a backup artifact
-                      $orig | Out-File -FilePath $backupFile -Encoding UTF8
                   }
               }
-
-              Write-Host "Backup artifact saved to $backupFile"
+              
+              # ----------------------------------------------------
+              # 2. Backup Tables by copying them (SELECT * INTO)
+              # *** UPDATED *** - Now processes both ALTER TABLE and DROP TABLE
+              # ----------------------------------------------------
+              if ($tableObjects.Count -gt 0) {
+                  Write-Host "Backing up $($tableObjects.Count) table(s) by copying..."
+                  $backupScriptContent += "`r`n-- ========================================`r`n"
+                  $backupScriptContent += "-- TABLE BACKUPS (COPIES)`r`n"
+                  $backupScriptContent += "-- Actions: $((($tableObjects | ForEach-Object { $_.action }) -join ', '))`r`n"
+                  $backupScriptContent += "-- ========================================`r`n`r`n"
+          
+                  foreach ($table in $tableObjects) {
+                      $fullName = "[$($table.schema)].[$($table.name)]"
+                      $backupTableName = "[$($table.schema)].[$($table.name)_backup_$timestamp]"
+                      $action = $table.action
+                      Write-Host "  Processing $action on table $fullName - copying to $backupTableName"
+                      
+                      # Build the copy query without here-string
+                      $copyQuery = "-- Backup for table $($table.schema).$($table.name) (Action: $action)`r`n"
+                      $copyQuery += "IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    BEGIN TRY`r`n"
+                      $copyQuery += "        SELECT * INTO $backupTableName FROM [$($table.schema)].[$($table.name)];`r`n"
+                      $copyQuery += "        PRINT 'Successfully copied [$($table.schema)].[$($table.name)] to $backupTableName (Action: $action)';`r`n"
+                      $copyQuery += "    END TRY`r`n"
+                      $copyQuery += "    BEGIN CATCH`r`n"
+                      $copyQuery += "        PRINT 'ERROR: Failed to copy [$($table.schema)].[$($table.name)]. Error: ' + ERROR_MESSAGE();`r`n"
+                      $copyQuery += "    END CATCH`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Table [$($table.schema)].[$($table.name)] does not exist. Cannot create backup copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Backup table $backupTableName already exists. Skipping copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "GO`r`n"
+                      
+                      $backupScriptContent += $copyQuery
+                      
+                      try {
+                          # Execute the copy operation right now
+                          Invoke-Sqlcmd -ConnectionString $connectionString -Query $copyQuery -QueryTimeout 300 -ErrorAction Stop
+                          Write-Host "    Successfully executed copy command for $fullName (Action: $action)"
+                          $tablesCopied++
+                      }
+                      catch {
+                          $errorMessage = $_.Exception.Message
+                          Write-Warning "  Failed to execute copy for ${fullName}: ${errorMessage}"
+                      }
+                  }
+              }
+          
+              $totalBackedUp = $objectsBackedUp + $tablesCopied
+              
+              if ($totalBackedUp -eq 0) {
+                  Write-Host "No existing objects were found to back up."
+                  $backupScriptContent += "`r`n-- No existing objects were found to back up`r`n"
+              }
+              
+              $backupScriptContent | Out-File -FilePath $backupFile -Encoding UTF8
+              Write-Host "Backup script saved to: $backupFile"
+              Write-Host "Total objects scripted and copied (live): $objectsBackedUp"
+              Write-Host "Total tables copied (live): $tablesCopied"
+              
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
               Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]backup_$timestamp.sql"
+              Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]$totalBackedUp"
           }
           catch {
-              Write-Warning "Backup step encountered an error: $($_.Exception.Message)"
-              # Do not fail pipeline on backup errors by default; fail the job if you prefer
-              # exit 1
+              Write-Error "Backup failed: $($_.Exception.Message)"
+              exit 1
           }
 
     - task: PublishPipelineArtifact@1
@@ -471,12 +915,9 @@ stages:
         artifact: 'DatabaseBackup'
         publishLocation: 'pipeline'
 
-# ============================================================
-# Execute SQL Script Stage
-# ============================================================
 - stage: Execute_SQL_Script
   displayName: 'Execute SQL Script'
-  dependsOn:
+  dependsOn: 
     - Download_And_Validate
     - Security_Review
     - Backup_Database_Objects
@@ -486,16 +927,17 @@ stages:
       not(canceled()),
       eq('${{ parameters.dryRun }}', 'false')
     )
-
+  
   jobs:
   - job: ExecuteScript
     displayName: 'Run SQL Script'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 60
+    
     steps:
     - checkout: none
-
+    
     - task: DownloadPipelineArtifact@2
       displayName: 'Download SQL Script'
       inputs:
@@ -511,55 +953,124 @@ stages:
         azurePowerShellVersion: 'LatestVersion'
         Inline: |
           $ErrorActionPreference = "Stop"
+          
           try {
-              Write-Host "Retrieving connection string."
+              Write-Host "Retrieving connection string..."
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
-              if (-not $connectionString) {
-                  throw "Connection string retrieval failed"
+              
+              Write-Host "Reading SQL script..."
+              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw
+              
+              if ([string]::IsNullOrEmpty($scriptContent)) {
+                  throw "SQL script is empty"
               }
-
-              $scriptFile = Get-ChildItem -Path "$(Pipeline.Workspace)/sql" -Filter *.sql -Recurse | Select-Object -First 1
-              if ($scriptFile) {
-                  $scriptPath = $scriptFile.FullName
-              } else {
-                  $scriptPath = "$(sqlScriptPath)"
-              }
-
-              Write-Host "Executing SQL script at: $scriptPath"
-              $scriptContent = Get-Content -Path $scriptPath -Raw -ErrorAction Stop
-              # Normalize non-breaking spaces
-              $scriptContent = $scriptContent.Replace([char]0x00A0, [char]0x0020)
-
-              # Split into batches on lines that contain only GO (case-insensitive)
+              
+              New-Item -ItemType Directory -Force -Path "$(logsPath)" | Out-Null
+              $logFile = "$(logsPath)/execution_log.txt"
+              
+              $logHeader = "========================================"
+              $logHeader += "`r`nSQL SCRIPT EXECUTION LOG"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`nBuild: $(Build.BuildNumber)"
+              $logHeader += "`r`nScript: ${{ parameters.sqlScriptName }}"
+              $logHeader += "`r`nStarted: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`n`r`n"
+              
+              $logHeader | Out-File -FilePath $logFile -Encoding UTF8
+              
+              # FIXED: Enhanced batch splitting that handles CREATE/ALTER PROCEDURE properly
+              # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
               $batches = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
-              Write-Host "Found $($batches.Count) batch(es) to execute."
-
-              $batchIndex = 0
-              foreach ($batch in $batches) {
-                  $batchIndex++
-                  $toExecute = $batch -replace '(?i)\bGO\b',''
-                  $toExecute = $toExecute.Trim()
-                  if ($toExecute -eq "") { continue }
-                  Write-Host "Executing batch $batchIndex..."
+              
+              Write-Host "Found $($batches.Count) statement batch(es)"
+              
+              $executedCount = 0
+              $totalDuration = [TimeSpan]::Zero
+              
+              # Process each batch
+              for ($batchIndex = 0; $batchIndex -lt $batches.Count; $batchIndex++) {
+                  $statement = $batches[$batchIndex].Trim()
+                  
+                  if ([string]::IsNullOrWhiteSpace($statement)) {
+                      continue
+                  }
+                  
+                  $batchNumber = $batchIndex + 1
+                  $preview = if ($statement.Length -gt 150) { $statement.Substring(0, 150) + "..." } else { $statement }
+                  
+                  Write-Host ""
+                  Write-Host "Executing batch $batchNumber of $($batches.Count)"
+                  Write-Host $preview
+                  
+                  $timeStamp = Get-Date -Format "HH:mm:ss"
+                  "Batch $batchNumber - $timeStamp" | Out-File -FilePath $logFile -Append
+                  $preview | Out-File -FilePath $logFile -Append
+                  
                   try {
-                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $toExecute -QueryTimeout 600 -ErrorAction Stop
-                      Write-Host "  ✓ Batch $batchIndex executed"
-                  } catch {
-                      Write-Host "Batch $batchIndex failed: $($_.Exception.Message)"
-                      throw "SQL execution failed at batch $batchIndex"
+                      $startTime = Get-Date
+                      
+                      # FIXED: Handle CREATE/ALTER PROCEDURE/FUNCTION batches specially
+                      # These must be the only statement in their batch
+                      if ($statement -match '^\s*(CREATE|ALTER)\s+(PROCEDURE|FUNCTION)\s+') {
+                          Write-Host "  Detected CREATE/ALTER PROCEDURE/FUNCTION - executing as isolated batch"
+                          
+                          # Ensure this batch doesn't contain multiple statements
+                          $cleanBatch = $statement.Trim()
+                          
+                          # Remove any trailing semicolons that might cause issues
+                          $cleanBatch = $cleanBatch -replace ';\s*$', ''
+                          
+                          Invoke-Sqlcmd -ConnectionString $connectionString `
+                                        -Query $cleanBatch `
+                                        -QueryTimeout 600 `
+                                        -ErrorAction Stop
+                      } else {
+                          # Regular batch execution
+                          Invoke-Sqlcmd -ConnectionString $connectionString `
+                                        -Query $statement `
+                                        -QueryTimeout 600 `
+                                        -ErrorAction Stop
+                      }
+                      
+                      $duration = (Get-Date) - $startTime
+                      $totalDuration += $duration
+                      $executedCount++
+                      
+                      $successMsg = "Batch $batchNumber completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      Write-Host $successMsg -ForegroundColor Green
+                      "$successMsg`n" | Out-File -FilePath $logFile -Append
+                  }
+                  catch {
+                      $errorMsg = "Batch $batchNumber failed: $($_.Exception.Message)"
+                      Write-Host $errorMsg -ForegroundColor Red
+                      "$errorMsg`n" | Out-File -FilePath $logFile -Append
+                      
+                      # Enhanced error information
+                      Write-Host "  Batch content (first 500 chars): $($statement.Substring(0, [Math]::Min(500, $statement.Length)))" -ForegroundColor Yellow
+                      
+                      throw "SQL execution failed at batch $batchNumber"
                   }
               }
-
+              
               Write-Host ""
               Write-Host "SQL SCRIPT EXECUTED SUCCESSFULLY" -ForegroundColor Green
+              Write-Host "Batches executed: $executedCount" -ForegroundColor Green
+              Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
+              
+              $roundedDuration = [math]::Round($totalDuration.TotalSeconds, 2)
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
+              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
+              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$roundedDuration"
           }
           catch {
               Write-Host ""
               Write-Host "SQL SCRIPT EXECUTION FAILED" -ForegroundColor Red
               Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+              
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
-              Write-Host "##vso[task.logissue type=error]SQL execution failed: $($_.Exception.Message)"
+              Write-Host "##vso[task.logissue type=error]SQL execution failed"
+              
               exit 1
           }
 
@@ -571,4 +1082,103 @@ stages:
         artifact: 'ExecutionLogs'
         publishLocation: 'pipeline'
 
-# End of pipeline - Notification & Audit stage intentionally removed
+- stage: Notify_And_Audit
+  displayName: 'Notification and Audit'
+  dependsOn: 
+    - Download_And_Validate
+    - Backup_Database_Objects
+    - Execute_SQL_Script
+  condition: always()
+  
+  jobs:
+  - job: SendNotification
+    displayName: 'Send Execution Results'
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 10
+    
+    steps:
+    - checkout: none
+    
+    - task: PowerShell@2
+      displayName: 'Generate Execution Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $result = "$(ExecuteSQL.executionResult)"
+          $buildNumber = "$(Build.BuildNumber)"
+          $scriptName = "${{ parameters.sqlScriptName }}"
+          $isDryRun = "${{ parameters.dryRun }}"
+          
+          Write-Host ""
+          Write-Host "=" * 70
+          Write-Host "PIPELINE EXECUTION SUMMARY"
+          Write-Host "=" * 70
+          Write-Host "Build Number: $buildNumber"
+          Write-Host "Script Name: $scriptName"
+          Write-Host "Dry Run Mode: $isDryRun"
+          Write-Host "Executed By: $(Build.RequestedFor)"
+          
+          if ($isDryRun -eq "true") {
+              Write-Host ""
+              Write-Host "DRY RUN COMPLETED - VALIDATION ONLY" -ForegroundColor Cyan
+          }
+          elseif ($result -eq "Success") {
+              Write-Host ""
+              Write-Host "EXECUTION SUCCESSFUL" -ForegroundColor Green
+          } else {
+              Write-Host ""
+              Write-Host "EXECUTION FAILED" -ForegroundColor Red
+          }
+          
+          Write-Host "=" * 70
+
+    - task: AzurePowerShell@5
+      displayName: 'Create Audit Trail'
+      condition: eq('${{ parameters.dryRun }}', 'false')
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        ScriptType: 'InlineScript'
+        azurePowerShellVersion: 'LatestVersion'
+        Inline: |
+          $ErrorActionPreference = "Continue"
+          
+          try {
+              $auditLog = @{
+                  buildNumber = "$(Build.BuildNumber)"
+                  buildId = "$(Build.BuildId)"
+                  scriptName = "${{ parameters.sqlScriptName }}"
+                  executionResult = "$(ExecuteSQL.executionResult)"
+                  executedBy = "$(Build.RequestedFor)"
+                  executedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+                  dryRun = "${{ parameters.dryRun }}"
+              } | ConvertTo-Json
+              
+              $auditFile = "audit_$(Build.BuildNumber)_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+              $auditLog | Out-File -FilePath $auditFile -Encoding UTF8
+              
+              Write-Host "Audit log created: $auditFile"
+              
+              $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
+              
+              if ($storageAccount) {
+                  $ctx = $storageAccount.Context
+                  
+                  $container = Get-AzStorageContainer -Name "audit-logs" -Context $ctx -ErrorAction SilentlyContinue
+                  if (-not $container) {
+                      New-AzStorageContainer -Name "audit-logs" -Context $ctx -Permission Off
+                  }
+                  
+                  Set-AzStorageBlobContent `
+                      -File $auditFile `
+                      -Container "audit-logs" `
+                      -Blob $auditFile `
+                      -Context $ctx `
+                      -Force
+                  
+                  Write-Host "Audit log uploaded to blob storage"
+              }
+          }
+          catch {
+              Write-Warning "Failed to create audit trail: $($_.Exception.Message)"
+          }
