@@ -776,6 +776,9 @@ stages:
                                   # FIX 1: Trim all leading/trailing whitespace
                                   $definition = $result.Definition.Trim()
                                   
+                                  # *** FIX: Replace non-breaking spaces (U+00A0) with regular spaces (U+0020) ***
+                                  $definition = $definition.Replace([char]0x00A0, [char]0x0020)
+
                                   # Add definition to the artifact script (as before)
                                   $backupScriptContent += "-- Object Definition: $originalFullName ($objectType) - Action: $action`r`n"
                                   $backupScriptContent += $definition + "`r`n"
@@ -903,7 +906,7 @@ stages:
               
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
               Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]backup_$timestamp.sql"
-              Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]$totalBackedUp"
+              Write-Host "##vs[task.setvariable variable=objectsBackedUp;isOutput=true]$totalBackedUp"
           }
           catch {
               Write-Error "Backup failed: $($_.Exception.Message)"
@@ -963,6 +966,9 @@ stages:
               
               Write-Host "Reading SQL script..."
               $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw
+              
+              # *** FIX: Replace non-breaking spaces (U+00A0) with regular spaces (U+0020) ***
+              $scriptContent = $scriptContent.Replace([char]0x00A0, [char]0x0020)
               
               if ([string]::IsNullOrEmpty($scriptContent)) {
                   throw "SQL script is empty"
