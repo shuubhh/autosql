@@ -289,7 +289,7 @@ stages:
               clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
               clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
               clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
-              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
               
               # Pattern for UPDATE table_name - more specific
               update_match = re.search(r'\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
@@ -979,55 +979,58 @@ stages:
               
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
-              $statements = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
+              # FIXED: Use proper batch-by-batch execution as shown in the example
+              # Split the script into individual batches using GO statements
+              $batches = $scriptContent -split '\bGO\b' | Where-Object { $_.Trim() -ne '' }
               
-              Write-Host "Found $($statements.Count) statement batch(es)"
+              Write-Host "Found $($batches.Count) batch(es) to execute"
               
               $executedCount = 0
               $totalDuration = [TimeSpan]::Zero
               
-              # Use foreach over statements to avoid indexing/singular string issues
-              foreach ($statement in $statements) {
-                  $statement = $statement.Trim()
+              # Execute each batch separately using the example method
+              for ($i = 0; $i -lt $batches.Count; $i++) {
+                  $batch = $batches[$i].Trim()
                   
-                  if ([string]::IsNullOrWhiteSpace($statement)) {
+                  if ([string]::IsNullOrWhiteSpace($batch)) {
                       continue
                   }
                   
-                  $executedCountForPreview = $executedCount + 1
-                  $preview = if ($statement.Length -gt 150) { $statement.Substring(0, 150) + "..." } else { $statement }
+                  $batchNumber = $i + 1
+                  $preview = if ($batch.Length -gt 150) { $batch.Substring(0, 150) + "..." } else { $batch }
                   
                   Write-Host ""
-                  Write-Host "Executing batch $executedCountForPreview of $($statements.Count)"
+                  Write-Host "Executing batch $batchNumber of $($batches.Count)"
                   Write-Host $preview
                   
-                  # FIXED: Use double quotes and format the time separately to avoid string termination issues
                   $timeStamp = Get-Date -Format "HH:mm:ss"
-                  "Batch $executedCountForPreview - $timeStamp" | Out-File -FilePath $logFile -Append
+                  "Batch $batchNumber - $timeStamp" | Out-File -FilePath $logFile -Append
                   $preview | Out-File -FilePath $logFile -Append
                   
                   try {
                       $startTime = Get-Date
                       
-                      Invoke-Sqlcmd -ConnectionString $connectionString `
-                                    -Query $statement `
-                                    -QueryTimeout 600 `
-                                    -ErrorAction Stop
+                      # FIXED: Use the proper batch execution method from the example
+                      # Each batch is executed as a separate Invoke-Sqlcmd call
+                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $batch -QueryTimeout 600 -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
                       $totalDuration += $duration
                       $executedCount++
                       
-                      $successMsg = "Batch $executedCountForPreview completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      $successMsg = "Batch $batchNumber completed in $([math]::Round($duration.TotalSeconds, 2))s"
                       Write-Host $successMsg -ForegroundColor Green
                       "$successMsg`n" | Out-File -FilePath $logFile -Append
                   }
                   catch {
-                      $errorMsg = "Batch $executedCountForPreview failed: $($_.Exception.Message)"
+                      $errorMsg = "Batch $batchNumber failed: $($_.Exception.Message)"
                       Write-Host $errorMsg -ForegroundColor Red
                       "$errorMsg`n" | Out-File -FilePath $logFile -Append
-                      throw "SQL execution failed at batch $executedCountForPreview"
+                      
+                      # Enhanced error information
+                      Write-Host "  Batch content (first 500 chars): $($batch.Substring(0, [Math]::Min(500, $batch.Length)))" -ForegroundColor Yellow
+                      
+                      throw "SQL execution failed at batch $batchNumber"
                   }
               }
               
