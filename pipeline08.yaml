@@ -731,17 +731,14 @@ stages:
               
               New-Item -ItemType Directory -Force -Path '$(backupPath)' | Out-Null
               
-              $backupScriptContent = @"
-          -- ============================================================
-          -- DATABASE BACKUP SCRIPT (AFFECTED OBJECTS ONLY)
-          -- ============================================================
-          -- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          -- Build: $(Build.BuildNumber)
-          -- Original Script: ${{ parameters.sqlScriptName }}
-          -- Backs up definitions for objects targeted by ALTER/DROP
-          -- ============================================================
-          
-          "@
+              $backupScriptContent = "-- ============================================================`r`n"
+              $backupScriptContent += "-- DATABASE BACKUP SCRIPT (AFFECTED OBJECTS ONLY)`r`n"
+              $backupScriptContent += "-- ============================================================`r`n"
+              $backupScriptContent += "-- Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
+              $backupScriptContent += "-- Build: $(Build.BuildNumber)`r`n"
+              $backupScriptContent += "-- Original Script: ${{ parameters.sqlScriptName }}`r`n"
+              $backupScriptContent += "-- Backs up definitions for objects targeted by ALTER/DROP`r`n"
+              $backupScriptContent += "-- ============================================================`r`n`r`n"
               
               $objectsBackedUp = 0
               $tablesCopied = 0
@@ -847,29 +844,27 @@ stages:
                       $action = $table.action
                       Write-Host "  Processing $action on table $fullName - copying to $backupTableName"
                       
-                      # Note: Schema and name are already parsed, removing extra brackets from $fullName
-                      $copyQuery = @"
-          -- Backup for table $($table.schema).$($table.name) (Action: $action)
-          IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL
-          BEGIN
-              BEGIN TRY
-                  SELECT * INTO $backupTableName FROM [$($table.schema)].[$($table.name)];
-                  PRINT 'Successfully copied [$($table.schema)].[$($table.name)] to $backupTableName (Action: $action)';
-              END TRY
-              BEGIN CATCH
-                  PRINT 'ERROR: Failed to copy [$($table.schema)].[$($table.name)]. Error: ' + ERROR_MESSAGE();
-              END CATCH
-          END
-          ELSE IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NULL
-          BEGIN
-              PRINT 'WARNING: Table [$($table.schema)].[$($table.name)] does not exist. Cannot create backup copy.';
-          END
-          ELSE
-          BEGIN
-              PRINT 'WARNING: Backup table $backupTableName already exists. Skipping copy.';
-          END
-          GO
-          "@
+                      # Build the copy query without here-string
+                      $copyQuery = "-- Backup for table $($table.schema).$($table.name) (Action: $action)`r`n"
+                      $copyQuery += "IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    BEGIN TRY`r`n"
+                      $copyQuery += "        SELECT * INTO $backupTableName FROM [$($table.schema)].[$($table.name)];`r`n"
+                      $copyQuery += "        PRINT 'Successfully copied [$($table.schema)].[$($table.name)] to $backupTableName (Action: $action)';`r`n"
+                      $copyQuery += "    END TRY`r`n"
+                      $copyQuery += "    BEGIN CATCH`r`n"
+                      $copyQuery += "        PRINT 'ERROR: Failed to copy [$($table.schema)].[$($table.name)]. Error: ' + ERROR_MESSAGE();`r`n"
+                      $copyQuery += "    END CATCH`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Table [$($table.schema)].[$($table.name)] does not exist. Cannot create backup copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Backup table $backupTableName already exists. Skipping copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "GO`r`n"
                       
                       $backupScriptContent += $copyQuery
                       
@@ -968,16 +963,15 @@ stages:
               New-Item -ItemType Directory -Force -Path "$(logsPath)" | Out-Null
               $logFile = "$(logsPath)/execution_log.txt"
               
-              $logHeader = @"
-          ========================================
-          SQL SCRIPT EXECUTION LOG
-          ========================================
-          Build: $(Build.BuildNumber)
-          Script: ${{ parameters.sqlScriptName }}
-          Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          ========================================
-          
-          "@
+              $logHeader = "========================================"
+              $logHeader += "`r`nSQL SCRIPT EXECUTION LOG"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`nBuild: $(Build.BuildNumber)"
+              $logHeader += "`r`nScript: ${{ parameters.sqlScriptName }}"
+              $logHeader += "`r`nStarted: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`n`r`n"
+              
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
               # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
