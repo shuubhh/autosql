@@ -1035,9 +1035,10 @@ stages:
               Write-Host "Batches executed: $executedCount" -ForegroundColor Green
               Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
               
+              $roundedDuration = [math]::Round($totalDuration.TotalSeconds, 2)
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
               Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
-              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration.TotalSeconds, 2))"
+              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$roundedDuration"
           }
           catch {
               Write-Host ""
