@@ -311,7 +311,7 @@ stages:
               clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
               clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
               clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
-              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
               
               # Pattern for ALTER TABLE - more specific and avoids capturing 'ALTER' as table name
               alter_match = re.search(r'\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
@@ -343,7 +343,7 @@ stages:
                       clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
                       clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
                       clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
-                      clean_stmt = re.sub(r'".*?"', '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
                       
                       # Check if UPDATE has WHERE clause
                       if 'UPDATE' in clean_stmt and 'WHERE' not in clean_stmt:
@@ -357,7 +357,7 @@ stages:
                       clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
                       clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
                       clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
-                      clean_stmt = re.sub(r'".*?"', '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
                       
                       # Check if DELETE has WHERE clause
                       if 'DELETE' in clean_stmt and 'WHERE' not in clean_stmt:
@@ -975,7 +975,7 @@ stages:
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
               # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
-              $statements = @($scriptContent -split '(?mi)^\s*GO\s*) | Where-Object { $_.Trim() -ne "" }
+              $statements = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
               
               Write-Host "Found $($statements.Count) statement batch(es)"
               
@@ -997,7 +997,9 @@ stages:
                   Write-Host "Executing batch $executedCountForPreview of $($statements.Count)"
                   Write-Host $preview
                   
-                  "Batch $executedCountForPreview - $(Get-Date -Format 'HH:mm:ss')" | Out-File -FilePath $logFile -Append
+                  # FIXED: Use double quotes and format the time separately to avoid string termination issues
+                  $timeStamp = Get-Date -Format "HH:mm:ss"
+                  "Batch $executedCountForPreview - $timeStamp" | Out-File -FilePath $logFile -Append
                   $preview | Out-File -FilePath $logFile -Append
                   
                   try {
