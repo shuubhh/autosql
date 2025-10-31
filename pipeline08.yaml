@@ -782,14 +782,18 @@ stages:
                                   
                                   # --------------------------------------------------------
                                   # NEW LOGIC: Create the live backup object in the database
-                                  # *** UPDATED *** - Now works for both ALTER and DROP with GO separator
+                                  # *** FIXED *** - Remove GO statements and handle batch execution properly
                                   # --------------------------------------------------------
                                   Write-Host "    Attempting to create live backup object: $backupFullName"
 
-                                  # 1. Clean up potential existing backup (safety check)
-                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName; `r`n" +
-                                                   "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName; `r`n" +
-                                                   "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName; `r`n"
+                                  # 1. Clean up potential existing backup (safety check) - execute separately
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;"
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
 
                                   # 2. Modify the Definition Script to use the backup name
@@ -806,11 +810,12 @@ stages:
                                   
                                   $liveBackupQuery = $lines -join "`r`n"
                                   
-                                  # Add GO separator before creating the backup object
-                                  $liveBackupQueryWithGo = "GO`r`n" + $liveBackupQuery + "`r`nGO"
+                                  # Remove any GO statements from the query for procedure/function creation
+                                  # since CREATE PROCEDURE/FUNCTION must be the first statement in batch
+                                  $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
                                   
-                                  # Execute the new CREATE command
-                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQueryWithGo -QueryTimeout 300 -ErrorAction Stop
+                                  # Execute the CREATE command in its own batch
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
                                   $objectsBackedUp++
                               } else {
@@ -894,7 +899,7 @@ stages:
               Write-Host "Total tables copied (live): $tablesCopied"
               
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
-              Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]$blobName"
+              Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]backup_$timestamp.sql"
               Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]$totalBackedUp"
           }
           catch {
