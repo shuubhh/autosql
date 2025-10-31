@@ -979,77 +979,55 @@ stages:
               
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # FIXED: Enhanced batch splitting that handles CREATE/ALTER PROCEDURE properly
               # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
-              $batches = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
+              $statements = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
               
-              Write-Host "Found $($batches.Count) statement batch(es)"
+              Write-Host "Found $($statements.Count) statement batch(es)"
               
               $executedCount = 0
               $totalDuration = [TimeSpan]::Zero
               
-              # Process each batch
-              for ($batchIndex = 0; $batchIndex -lt $batches.Count; $batchIndex++) {
-                  $statement = $batches[$batchIndex].Trim()
+              # Use foreach over statements to avoid indexing/singular string issues
+              foreach ($statement in $statements) {
+                  $statement = $statement.Trim()
                   
                   if ([string]::IsNullOrWhiteSpace($statement)) {
                       continue
                   }
                   
-                  $batchNumber = $batchIndex + 1
+                  $executedCountForPreview = $executedCount + 1
                   $preview = if ($statement.Length -gt 150) { $statement.Substring(0, 150) + "..." } else { $statement }
                   
                   Write-Host ""
-                  Write-Host "Executing batch $batchNumber of $($batches.Count)"
+                  Write-Host "Executing batch $executedCountForPreview of $($statements.Count)"
                   Write-Host $preview
                   
+                  # FIXED: Use double quotes and format the time separately to avoid string termination issues
                   $timeStamp = Get-Date -Format "HH:mm:ss"
-                  "Batch $batchNumber - $timeStamp" | Out-File -FilePath $logFile -Append
+                  "Batch $executedCountForPreview - $timeStamp" | Out-File -FilePath $logFile -Append
                   $preview | Out-File -FilePath $logFile -Append
                   
                   try {
                       $startTime = Get-Date
                       
-                      # FIXED: Handle CREATE/ALTER PROCEDURE/FUNCTION batches specially
-                      # These must be the only statement in their batch
-                      if ($statement -match '^\s*(CREATE|ALTER)\s+(PROCEDURE|FUNCTION)\s+') {
-                          Write-Host "  Detected CREATE/ALTER PROCEDURE/FUNCTION - executing as isolated batch"
-                          
-                          # Ensure this batch doesn't contain multiple statements
-                          $cleanBatch = $statement.Trim()
-                          
-                          # Remove any trailing semicolons that might cause issues
-                          $cleanBatch = $cleanBatch -replace ';\s*$', ''
-                          
-                          Invoke-Sqlcmd -ConnectionString $connectionString `
-                                        -Query $cleanBatch `
-                                        -QueryTimeout 600 `
-                                        -ErrorAction Stop
-                      } else {
-                          # Regular batch execution
-                          Invoke-Sqlcmd -ConnectionString $connectionString `
-                                        -Query $statement `
-                                        -QueryTimeout 600 `
-                                        -ErrorAction Stop
-                      }
+                      Invoke-Sqlcmd -ConnectionString $connectionString `
+                                    -Query $statement `
+                                    -QueryTimeout 600 `
+                                    -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
                       $totalDuration += $duration
                       $executedCount++
                       
-                      $successMsg = "Batch $batchNumber completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      $successMsg = "Batch $executedCountForPreview completed in $([math]::Round($duration.TotalSeconds, 2))s"
                       Write-Host $successMsg -ForegroundColor Green
                       "$successMsg`n" | Out-File -FilePath $logFile -Append
                   }
                   catch {
-                      $errorMsg = "Batch $batchNumber failed: $($_.Exception.Message)"
+                      $errorMsg = "Batch $executedCountForPreview failed: $($_.Exception.Message)"
                       Write-Host $errorMsg -ForegroundColor Red
                       "$errorMsg`n" | Out-File -FilePath $logFile -Append
-                      
-                      # Enhanced error information
-                      Write-Host "  Batch content (first 500 chars): $($statement.Substring(0, [Math]::Min(500, $statement.Length)))" -ForegroundColor Yellow
-                      
-                      throw "SQL execution failed at batch $batchNumber"
+                      throw "SQL execution failed at batch $executedCountForPreview"
                   }
               }
               
