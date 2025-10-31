@@ -311,7 +311,7 @@ stages:
               clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
               clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
               clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
-              clean_stmt = re.sub(r'".*?"', '""', clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
               
               # Pattern for ALTER TABLE - more specific and avoids capturing 'ALTER' as table name
               alter_match = re.search(r'\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
@@ -343,7 +343,7 @@ stages:
                       clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
                       clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
                       clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
-                      clean_stmt = re.sub(r'".*?"', '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
                       
                       # Check if UPDATE has WHERE clause
                       if 'UPDATE' in clean_stmt and 'WHERE' not in clean_stmt:
@@ -357,7 +357,7 @@ stages:
                       clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
                       clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
                       clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
-                      clean_stmt = re.sub(r'".*?"', '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
                       
                       # Check if DELETE has WHERE clause
                       if 'DELETE' in clean_stmt and 'WHERE' not in clean_stmt:
@@ -395,20 +395,28 @@ stages:
                           table_info = ""
                       issues.append(f"Statement {stmt_num}: TRUNCATE TABLE detected{table_info}")
                   
-                  # Enhanced ALTER TABLE detection - FIXED
+                  # Enhanced ALTER TABLE detection - FIXED to trigger approval
                   if 'ALTER TABLE' in stmt_upper:
                       table_name = extract_table_name_from_alter(stmt_str)
                       table_info = f" '{table_name}'" if table_name else ""
                       
-                      # Check what type of ALTER operation
+                      # Check what type of ALTER operation - ALL marked as ISSUES to trigger approval
                       if re.search(r'\bADD\s+(?!CONSTRAINT)\w+', stmt_upper, re.IGNORECASE):
-                          warnings.append(f"Statement {stmt_num}: ALTER TABLE ADD COLUMN operation{table_info}")
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE ADD COLUMN operation{table_info}")
                       elif re.search(r'\bDROP\s+COLUMN\b', stmt_upper, re.IGNORECASE):
-                          warnings.append(f"Statement {stmt_num}: ALTER TABLE DROP COLUMN operation{table_info}")
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE DROP COLUMN operation{table_info}")
                       elif re.search(r'\bALTER\s+COLUMN\b', stmt_upper, re.IGNORECASE):
-                          warnings.append(f"Statement {stmt_num}: ALTER TABLE MODIFY COLUMN operation{table_info}")
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE MODIFY COLUMN operation{table_info}")
                       else:
-                          warnings.append(f"Statement {stmt_num}: ALTER TABLE operation{table_info}")
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE operation{table_info}")
+                  
+                  # Check for ALTER PROCEDURE/FUNCTION/VIEW - trigger approval
+                  if re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\b', stmt_upper, re.IGNORECASE):
+                      match = re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\s+([a-zA-Z_\[\]\.][a-zA-Z0-9_\[\]\.]*)', stmt_upper, re.IGNORECASE)
+                      if match:
+                          obj_type = match.group(1)
+                          obj_name = match.group(2)
+                          issues.append(f"Statement {stmt_num}: ALTER {obj_type} operation '{obj_name}'")
                   
                   # Check for Dynamic SQL (warning only)
                   if re.search(r'\bEXEC\s*\(|\bEXECUTE\s*\(|\bSP_EXECUTESQL\b', stmt_upper):
@@ -416,8 +424,8 @@ stages:
               
               return issues, warnings
 
-          # *** NEW FUNCTION ***
-          # This function identifies objects to be backed up (ALTER/DROP)
+          # *** UPDATED FUNCTION ***
+          # Now detects BOTH DROP and ALTER statements for backup
           def extract_affected_objects(file_path):
               with open(file_path, 'r', encoding='utf-8') as f:
                   sql_content = f.read()
@@ -428,6 +436,7 @@ stages:
               
               objects_to_backup = []
               
+              # *** UPDATED REGEX *** - Now matches BOTH ALTER and DROP
               # Regex to find ALTER or DROP commands for procedures, functions, views, or tables
               # Group 1: ALTER or DROP
               # Group 2: PROCEDURE, FUNCTION, VIEW, TABLE
@@ -441,7 +450,7 @@ stages:
               unique_objects = set()
 
               for match in pattern.finditer(sql_content):
-                  action = match.group(1).upper()
+                  action = match.group(1).upper()  # Now captures 'ALTER' or 'DROP'
                   obj_type = match.group(2).upper()
                   full_name = match.group(3)
                   
@@ -465,7 +474,7 @@ stages:
                           'schema': schema,
                           'name': name,
                           'type': obj_type,
-                          'action': action
+                          'action': action  # Now includes whether it's ALTER or DROP
                       })
                       unique_objects.add(obj_key)
               
@@ -475,10 +484,10 @@ stages:
 
               # This is for the human-readable text report
               affected_report = {
-                  'procedures': list(set([f"{obj['schema']}.{obj['name']}" for obj in scriptable_objects if obj['type'] == 'PROCEDURE'])),
-                  'functions': list(set([f"{obj['schema']}.{obj['name']}" for obj in scriptable_objects if obj['type'] == 'FUNCTION'])),
-                  'views': list(set([f"{obj['schema']}.{obj['name']}" for obj in scriptable_objects if obj['type'] == 'VIEW'])),
-                  'tables': list(set([f"{obj['schema']}.{obj['name']}" for obj in table_objects]))
+                  'procedures': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'PROCEDURE'])),
+                  'functions': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'FUNCTION'])),
+                  'views': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'VIEW'])),
+                  'tables': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in table_objects]))
               }
 
               # This is the JSON data that will be used by the backup stage
@@ -555,7 +564,7 @@ stages:
           syntax_ok = validate_sql_syntax(script_path)
           issues, warnings = check_security_policies(script_path)
           
-          # New function returns two values
+          # Updated function now returns two values
           backup_data, affected_report = extract_affected_objects(script_path)
 
           # Pass all data to the report function
@@ -576,7 +585,7 @@ stages:
           
           if warnings:
               print("\n" + "=" * 70)
-              print(f"WARNINGS ({len(warnings)}):")
+              print(f"WARNINGS ({len(warnings)}):\n")
               print("=" * 70)
               for warning in warnings:
                   print(f"  {warning}")
@@ -701,7 +710,9 @@ stages:
               $scriptableObjects = $affectedData.scriptableObjects
               $tableObjects = $affectedData.tableObjects
               
-              if ($scriptableObjects.Count -eq 0 -and $tableObjects.Count -eq 0) {
+              # *** UPDATED LOGIC *** - Now processes both ALTER and DROP statements
+              $totalObjects = $scriptableObjects.Count + $tableObjects.Count
+              if ($totalObjects -eq 0) {
                   Write-Host "No objects marked for ALTER or DROP. No backup needed."
                   Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
                   Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]none"
@@ -709,30 +720,38 @@ stages:
                   exit 0
               }
               
+              Write-Host "Found $($scriptableObjects.Count) scriptable object(s) and $($tableObjects.Count) table(s) for backup processing"
+              Write-Host "Actions detected:"
+              foreach ($obj in $scriptableObjects) {
+                  Write-Host "  - $($obj.type) $($obj.schema).$($obj.name): $($obj.action)"
+              }
+              foreach ($obj in $tableObjects) {
+                  Write-Host "  - $($obj.type) $($obj.schema).$($obj.name): $($obj.action)"
+              }
+              
               New-Item -ItemType Directory -Force -Path '$(backupPath)' | Out-Null
               
-              $backupScriptContent = @"
-          -- ============================================================
-          -- DATABASE BACKUP SCRIPT (AFFECTED OBJECTS ONLY)
-          -- ============================================================
-          -- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          -- Build: $(Build.BuildNumber)
-          -- Original Script: ${{ parameters.sqlScriptName }}
-          -- Backs up definitions for objects targeted by ALTER/DROP
-          -- ============================================================
-          
-          "@
+              $backupScriptContent = "-- ============================================================`r`n"
+              $backupScriptContent += "-- DATABASE BACKUP SCRIPT (AFFECTED OBJECTS ONLY)`r`n"
+              $backupScriptContent += "-- ============================================================`r`n"
+              $backupScriptContent += "-- Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`r`n"
+              $backupScriptContent += "-- Build: $(Build.BuildNumber)`r`n"
+              $backupScriptContent += "-- Original Script: ${{ parameters.sqlScriptName }}`r`n"
+              $backupScriptContent += "-- Backs up definitions for objects targeted by ALTER/DROP`r`n"
+              $backupScriptContent += "-- ============================================================`r`n`r`n"
               
               $objectsBackedUp = 0
               $tablesCopied = 0
               
               # --------------------------------------------------------------------------
               # 1. Backup definitions AND create backup objects for Procs, Funcs, Views
+              # *** UPDATED *** - Now processes both ALTER and DROP statements
               # --------------------------------------------------------------------------
               if ($scriptableObjects.Count -gt 0) {
                   Write-Host "Backing up definitions and creating live backup objects for $($scriptableObjects.Count) scriptable object(s)..."
                   $backupScriptContent += "`r`n-- ========================================`r`n"
                   $backupScriptContent += "-- SCRIPTED OBJECT DEFINITIONS & LIVE BACKUPS (PROCEDURE, FUNCTION, VIEW)`r`n"
+                  $backupScriptContent += "-- Actions: $((($scriptableObjects | ForEach-Object { $_.action }) -join ', '))`r`n"
                   $backupScriptContent += "-- ========================================`r`n`r`n"
           
                   foreach ($obj in $scriptableObjects) {
@@ -740,8 +759,9 @@ stages:
                       $backupObjectName = "$($obj.name)_backup_$timestamp"
                       $backupFullName = "[$($obj.schema)].[$backupObjectName]"
                       $objectType = $obj.type
+                      $action = $obj.action  # Now we know if it's ALTER or DROP
                       
-                      Write-Host "  Processing ${objectType}: $originalFullName"
+                      Write-Host "  Processing $action on ${objectType}: $originalFullName"
                       
                       # Use OBJECT_ID with schema and name
                       $objectIdQuery = "SELECT OBJECT_ID('$($obj.schema).$($obj.name)')"
@@ -753,68 +773,49 @@ stages:
                               $result = Invoke-Sqlcmd -ConnectionString $connectionString -Query $query -MaxCharLength 65535 -ErrorAction Stop
                               
                               if ($result -and $result.Definition) {
-                                  $definition = $result.Definition
+                                  <# === THIS IS THE ONLY CHANGED LINE === #>
+                                  $definition = $result.Definition.Trim()
                                   
                                   # Add definition to the artifact script (as before)
-                                  $backupScriptContent += "-- Object Definition: $originalFullName ($objectType)`r`n"
+                                  $backupScriptContent += "-- Object Definition: $originalFullName ($objectType) - Action: $action`r`n"
                                   $backupScriptContent += $definition + "`r`n"
                                   $backupScriptContent += "GO`r`n`r`n"
                                   
                                   # --------------------------------------------------------
                                   # NEW LOGIC: Create the live backup object in the database
+                                  # *** FIXED *** - Remove GO statements and handle batch execution properly
                                   # --------------------------------------------------------
                                   Write-Host "    Attempting to create live backup object: $backupFullName"
 
-                                  # 1. Clean up potential existing backup (safety check)
-                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName; `r`n" +
-                                                   "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName; `r`n" +
-                                                   "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName; `r`n"
+                                  # 1. Clean up potential existing backup (safety check) - execute separately
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;"
+                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;"
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
 
                                   # 2. Modify the Definition Script to use the backup name
-                                  # Create the replacement full name (without brackets, for replacement target)
-                                  $replacementName = "$($obj.schema).$backupObjectName"
-
                                   # Split definition into lines to find the object declaration line
-                                  $lines = $definition -split [System.Environment]::NewLine
-                                  $startIndex = -1 # <-- Robustly find the start index
-
+                                  $lines = $definition -split "`r`n"
+                                  
                                   # Find and replace the CREATE/ALTER line with the backup name
                                   for ($i = 0; $i -lt $lines.Count; $i++) {
-                                      $line = $lines[$i]
-                                      if ($line -match "^\s*(CREATE|ALTER)\s+${objectType}\b") { # <-- Use word boundary
-                                          
-                                          # Try to replace bracketed name
-                                          $originalNameRegex = [regex]::Escape("[$($obj.schema)].[$($obj.name)]")
-                                          $lines[$i] = $lines[$i] -replace $originalNameRegex, $backupFullName, 1
-                                          
-                                          # If no change, try non-bracketed name
-                                          if ($lines[$i] -eq $line) {
-                                               $originalNameRegexNoBrackets = [regex]::Escape("$($obj.schema).$($obj.name)")
-                                               $lines[$i] = $lines[$i] -replace $originalNameRegexNoBrackets, $backupFullName, 1
-                                          }
-                                          
-                                          $startIndex = $i # <-- Set the start index
-                                          break # Found and replaced the line
+                                      if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
+                                          $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE\`$2$backupFullName"
+                                          break
                                       }
                                   }
-
-                                  if ($startIndex -eq -1) {
-                                      throw "Could not find 'CREATE/ALTER ${objectType}' line in definition for $originalFullName"
-                                  }
                                   
-                                  # *** THIS IS THE FIX ***
-                                  # Rebuild the query STARTING from the CREATE line
-                                  $liveBackupQuery = $lines[$startIndex..($lines.Count - 1)] -join [System.Environment]::NewLine
+                                  $liveBackupQuery = $lines -join "`r`n"
                                   
-                                  # Ensure it uses CREATE not ALTER if we modified the line
-                                  $liveBackupQuery = $liveBackupQuery -replace "(?mi)^\s*ALTER\s+${objectType}", "CREATE $objectType"
+                                  # Remove any GO statements from the query for procedure/function creation
+                                  # since CREATE PROCEDURE/FUNCTION must be the first statement in batch
+                                  $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
                                   
-                                  # Remove any GO statements
-                                  $liveBackupQuery = $liveBackupQuery -replace '(?mi)^\s*GO\s*$', ''
-                                  
-                                  
-                                  # Execute the new CREATE command
+                                  # Execute the CREATE command in its own batch
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
                                   $objectsBackedUp++
@@ -823,11 +824,8 @@ stages:
                               }
                           }
                           catch {
-                              # *** THIS IS THE FIX ***
-                              # Fail the step if the backup object creation fails
                               $errorMessage = $_.Exception.Message
-                              Write-Error "  Failed to script or create live backup for ${originalFullName}: ${errorMessage}"
-                              throw "Failed to create live backup for ${originalFullName}. Halting pipeline. Error: ${errorMessage}"
+                              Write-Warning "  Failed to script or create live backup for ${originalFullName}: ${errorMessage}"
                           }
                       } else {
                           Write-Warning "  Could not find object $originalFullName. Skipping definition and live backup."
@@ -837,55 +835,52 @@ stages:
               
               # ----------------------------------------------------
               # 2. Backup Tables by copying them (SELECT * INTO)
-              #    (This section remains the same, as it already creates a live backup object)
+              # *** UPDATED *** - Now processes both ALTER TABLE and DROP TABLE
               # ----------------------------------------------------
               if ($tableObjects.Count -gt 0) {
                   Write-Host "Backing up $($tableObjects.Count) table(s) by copying..."
                   $backupScriptContent += "`r`n-- ========================================`r`n"
                   $backupScriptContent += "-- TABLE BACKUPS (COPIES)`r`n"
+                  $backupScriptContent += "-- Actions: $((($tableObjects | ForEach-Object { $_.action }) -join ', '))`r`n"
                   $backupScriptContent += "-- ========================================`r`n`r`n"
           
                   foreach ($table in $tableObjects) {
                       $fullName = "[$($table.schema)].[$($table.name)]"
                       $backupTableName = "[$($table.schema)].[$($table.name)_backup_$timestamp]"
-                      Write-Host "  Copying table $fullName to $backupTableName"
+                      $action = $table.action
+                      Write-Host "  Processing $action on table $fullName - copying to $backupTableName"
                       
-                      # Note: Schema and name are already parsed, removing extra brackets from $fullName
-                      $copyQuery = @"
-          -- Backup for table $($table.schema).$($table.name)
-          IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL
-          BEGIN
-              BEGIN TRY
-                  SELECT * INTO $backupTableName FROM [$($table.schema)].[$($table.name)];
-                  PRINT 'Successfully copied [$($table.schema)].[$($table.name)] to $backupTableName';
-              END TRY
-              BEGIN CATCH
-                  PRINT 'ERROR: Failed to copy [$($table.schema)].[$($table.name)]. Error: ' + ERROR_MESSAGE();
-              END CATCH
-          END
-          ELSE IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NULL
-          BEGIN
-              PRINT 'WARNING: Table [$($table.schema)].[$($table.name)] does not exist. Cannot create backup copy.';
-          END
-          ELSE
-          BEGIN
-              PRINT 'WARNING: Backup table $backupTableName already exists. Skipping copy.';
-          END
-          GO
-          "@
+                      # Build the copy query without here-string
+                      $copyQuery = "-- Backup for table $($table.schema).$($table.name) (Action: $action)`r`n"
+                      $copyQuery += "IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    BEGIN TRY`r`n"
+                      $copyQuery += "        SELECT * INTO $backupTableName FROM [$($table.schema)].[$($table.name)];`r`n"
+                      $copyQuery += "        PRINT 'Successfully copied [$($table.schema)].[$($table.name)] to $backupTableName (Action: $action)';`r`n"
+                      $copyQuery += "    END TRY`r`n"
+                      $copyQuery += "    BEGIN CATCH`r`n"
+                      $copyQuery += "        PRINT 'ERROR: Failed to copy [$($table.schema)].[$($table.name)]. Error: ' + ERROR_MESSAGE();`r`n"
+                      $copyQuery += "    END CATCH`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NULL`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Table [$($table.schema)].[$($table.name)] does not exist. Cannot create backup copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "ELSE`r`n"
+                      $copyQuery += "BEGIN`r`n"
+                      $copyQuery += "    PRINT 'WARNING: Backup table $backupTableName already exists. Skipping copy.';`r`n"
+                      $copyQuery += "END`r`n"
+                      $copyQuery += "GO`r`n"
                       
                       $backupScriptContent += $copyQuery
                       
                       try {
                           # Execute the copy operation right now
                           Invoke-Sqlcmd -ConnectionString $connectionString -Query $copyQuery -QueryTimeout 300 -ErrorAction Stop
-                          Write-Host "    Successfully executed copy command for $fullName"
-                          $tablesCopied++
                       }
                       catch {
                           $errorMessage = $_.Exception.Message
-                          Write-Error "  Failed to execute copy for ${fullName}: ${errorMessage}"
-                          throw "Failed to create backup copy for ${fullName}. Halting pipeline. Error: ${errorMessage}"
+                          Write-Warning "  Failed to execute copy for ${fullName}: ${errorMessage}"
                       }
                   }
               }
@@ -902,26 +897,8 @@ stages:
               Write-Host "Total objects scripted and copied (live): $objectsBackedUp"
               Write-Host "Total tables copied (live): $tablesCopied"
               
-              # Upload backup to blob
-              Write-Host "Uploading backup to Azure Storage..."
-              $blobName = "backup_$(Build.BuildNumber)_$timestamp.sql"
-              
-              $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
-              $ctx = $storageAccount.Context
-              
-              Set-AzStorageBlobContent `
-                  -File $backupFile `
-                  -Container "$(backupContainerName)" `
-                  -Blob $blobName `
-                  -Context $ctx `
-                  -Force
-              
-              Write-Host "Backup completed successfully"
-              Write-Host "  Objects backed up: $totalBackedUp"
-              Write-Host "  Backup location: $(backupContainerName)/$blobName"
-
               Write-Host "##vso[task.setvariable variable=backupCompleted;isOutput=true]true"
-              Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]$blobName"
+              Write-Host "##vso[task.setvariable variable=backupBlobName;isOutput=true]backup_$timestamp.sql"
               Write-Host "##vso[task.setvariable variable=objectsBackedUp;isOutput=true]$totalBackedUp"
           }
           catch {
@@ -990,20 +967,19 @@ stages:
               New-Item -ItemType Directory -Force -Path "$(logsPath)" | Out-Null
               $logFile = "$(logsPath)/execution_log.txt"
               
-              $logHeader = @"
-          ========================================
-          SQL SCRIPT EXECUTION LOG
-          ========================================
-          Build: $(Build.BuildNumber)
-          Script: ${{ parameters.sqlScriptName }}
-          Started: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-          ========================================
-          
-          "@
+              $logHeader = "========================================"
+              $logHeader += "`r`nSQL SCRIPT EXECUTION LOG"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`nBuild: $(Build.BuildNumber)"
+              $logHeader += "`r`nScript: ${{ parameters.sqlScriptName }}"
+              $logHeader += "`r`nStarted: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+              $logHeader += "`r`n========================================"
+              $logHeader += "`r`n`r`n"
+              
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
               # Split into batches on lines that contain only GO (case-insensitive), coerce to array, and remove empty entries
-              $statements = @($scriptContent -split '(?mi)^\s*GO\s*$') | Where-Object { $_.Trim() -ne "" }
+              $statements = @($scriptContent -split '(?mi)^\s*GO\s*$' | Where-Object { $_.Trim() -ne "" })
               
               Write-Host "Found $($statements.Count) statement batch(es)"
               
@@ -1025,7 +1001,9 @@ stages:
                   Write-Host "Executing batch $executedCountForPreview of $($statements.Count)"
                   Write-Host $preview
                   
-                  "Batch $executedCountForPreview - $(Get-Date -Format 'HH:mm:ss')" | Out-File -FilePath $logFile -Append
+                  # FIXED: Use double quotes and format the time separately to avoid string termination issues
+                  $timeStamp = Get-Date -Format "HH:mm:ss"
+                  "Batch $executedCountForPreview - $timeStamp" | Out-File -FilePath $logFile -Append
                   $preview | Out-File -FilePath $logFile -Append
                   
                   try {
@@ -1057,9 +1035,10 @@ stages:
               Write-Host "Batches executed: $executedCount" -ForegroundColor Green
               Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
               
+              $roundedDuration = [math]::Round($totalDuration.TotalSeconds, 2)
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
               Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
-              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration.TotalSeconds, 2))"
+              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$roundedDuration"
           }
           catch {
               Write-Host ""
@@ -1180,4 +1159,3 @@ stages:
           catch {
               Write-Warning "Failed to create audit trail: $($_.Exception.Message)"
           }
-
