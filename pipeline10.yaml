@@ -979,16 +979,44 @@ stages:
               
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # FIXED: Proper batch splitting that handles single and multiple batches correctly
-              Write-Host "Splitting script into batches using GO statements..."
+              # FIXED: Enhanced batch processing with proper isolation
+              Write-Host "Processing SQL script batches..."
               
-              # Method 1: Split on GO statements and ensure we get string array
-              $batches = @($scriptContent -split '(?i)\bGO\b' | ForEach-Object { 
-                  $batch = $_.ToString().Trim()
-                  if (-not [string]::IsNullOrWhiteSpace($batch)) {
-                      $batch
+              # Clean the script content first - remove any BOM or special characters
+              $scriptContent = $scriptContent.Trim()
+              
+              # Method 1: Use a more reliable batch splitting approach
+              # Split on GO (case-insensitive) that are on their own line
+              $batches = @()
+              $currentBatch = [System.Text.StringBuilder]::new()
+              
+              $lines = $scriptContent -split "`r`n|`n|`r"
+              foreach ($line in $lines) {
+                  $trimmedLine = $line.Trim()
+                  
+                  # Check if this line is a GO statement (case-insensitive)
+                  if ($trimmedLine -eq 'GO' -or $trimmedLine -eq 'go' -or $trimmedLine -eq 'Go') {
+                      # Finalize current batch if it has content
+                      $batchContent = $currentBatch.ToString().Trim()
+                      if (-not [string]::IsNullOrWhiteSpace($batchContent)) {
+                          $batches += $batchContent
+                      }
+                      # Reset for next batch
+                      $currentBatch = [System.Text.StringBuilder]::new()
+                  } else {
+                      # Add line to current batch (with original line ending)
+                      if ($currentBatch.Length -gt 0) {
+                          $currentBatch.AppendLine() | Out-Null
+                      }
+                      $currentBatch.Append($line) | Out-Null
                   }
-              })
+              }
+              
+              # Add the final batch if it has content
+              $finalBatch = $currentBatch.ToString().Trim()
+              if (-not [string]::IsNullOrWhiteSpace($finalBatch)) {
+                  $batches += $finalBatch
+              }
               
               # If no batches found (no GO statements), treat entire script as one batch
               if ($batches.Count -eq 0) {
@@ -1001,16 +1029,9 @@ stages:
               $executedCount = 0
               $totalDuration = [TimeSpan]::Zero
               
-              # Execute each batch separately
+              # Execute each batch separately with proper isolation
               for ($i = 0; $i -lt $batches.Count; $i++) {
-                  $batch = $batches[$i]
-                  
-                  # Double-check that batch is a string
-                  if ($batch -isnot [string]) {
-                      $batch = $batch.ToString()
-                  }
-                  
-                  $batch = $batch.Trim()
+                  $batch = $batches[$i].Trim()
                   
                   if ([string]::IsNullOrWhiteSpace($batch)) {
                       Write-Host "Skipping empty batch $($i + 1)"
@@ -1033,8 +1054,29 @@ stages:
                       
                       Write-Host "Executing batch (length: $($batch.Length) characters)..."
                       
-                      # Execute the batch
-                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $batch -QueryTimeout 600 -ErrorAction Stop
+                      # FIXED: Enhanced batch execution with proper error handling
+                      # For CREATE/ALTER PROCEDURE statements, ensure they're properly isolated
+                      $cleanBatch = $batch
+                      
+                      # Remove any potential problematic characters or BOM
+                      $cleanBatch = $cleanBatch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B)
+                      
+                      # Ensure the batch starts with a valid SQL statement
+                      if ($cleanBatch -match '^\s*(CREATE|ALTER)\s+(PROCEDURE|FUNCTION)') {
+                          Write-Host "  Detected CREATE/ALTER PROCEDURE/FUNCTION - ensuring clean execution"
+                          
+                          # Remove any comments or problematic whitespace at the beginning
+                          $cleanBatch = $cleanBatch.Trim()
+                          
+                          # Ensure it starts exactly with CREATE or ALTER
+                          if ($cleanBatch -notmatch '^(CREATE|ALTER)') {
+                              # Extract just the CREATE/ALTER statement part
+                              $cleanBatch = $cleanBatch -replace '^.*?(CREATE|ALTER)', '$1'
+                          }
+                      }
+                      
+                      Write-Host "  Executing cleaned batch..."
+                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $cleanBatch -QueryTimeout 600 -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
                       $totalDuration += $duration
@@ -1050,8 +1092,16 @@ stages:
                       "$errorMsg`n" | Out-File -FilePath $logFile -Append
                       
                       # Enhanced error information
-                      Write-Host "Batch content (first 500 chars):" -ForegroundColor Yellow
-                      Write-Host $batch.Substring(0, [Math]::Min(500, $batch.Length)) -ForegroundColor Yellow
+                      Write-Host "Full batch content:" -ForegroundColor Yellow
+                      Write-Host $batch -ForegroundColor Yellow
+                      Write-Host "Batch length: $($batch.Length) characters" -ForegroundColor Yellow
+                      
+                      # Check for invisible characters
+                      Write-Host "First 10 characters (hex):" -ForegroundColor Yellow
+                      $firstChars = $batch.Substring(0, [Math]::Min(10, $batch.Length))
+                      foreach ($char in $firstChars.ToCharArray()) {
+                          Write-Host "  '$char' = 0x$([Convert]::ToString([int]$char, 16).PadLeft(4, '0'))" -ForegroundColor Yellow
+                      }
                       
                       throw "SQL execution failed at batch $batchNumber"
                   }
