@@ -773,7 +773,7 @@ stages:
                               $result = Invoke-Sqlcmd -ConnectionString $connectionString -Query $query -MaxCharLength 65535 -ErrorAction Stop
                               
                               if ($result -and $result.Definition) {
-                                  <# === THIS IS THE ONLY CHANGED LINE === #>
+                                  # FIX 1: Trim all leading/trailing whitespace
                                   $definition = $result.Definition.Trim()
                                   
                                   # Add definition to the artifact script (as before)
@@ -805,6 +805,10 @@ stages:
                                   for ($i = 0; $i -lt $lines.Count; $i++) {
                                       if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
                                           $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE\`$2$backupFullName"
+                                          
+                                          # FIX 2: Discard all preceding lines to ensure CREATE is the first line in the batch
+                                          $lines = $lines[$i..($lines.Count - 1)] 
+                                          
                                           break
                                       }
                                   }
