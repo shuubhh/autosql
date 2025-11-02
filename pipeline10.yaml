@@ -678,10 +678,8 @@ stages:
         Inline: |
           $ErrorActionPreference = "Stop"
           
-          # Helper function to escape object names for regex replacement
           function Escape-SqlName {
               param([string]$name)
-              # Escapes special characters in the name and handles brackets [ ]
               return [regex]::Escape($name).Replace('\\[', '[').Replace('\\]', ']').Replace('\\.', '.')
           }
           
@@ -710,7 +708,6 @@ stages:
               $scriptableObjects = $affectedData.scriptableObjects
               $tableObjects = $affectedData.tableObjects
               
-              # *** UPDATED LOGIC *** - Now processes both ALTER and DROP statements
               $totalObjects = $scriptableObjects.Count + $tableObjects.Count
               if ($totalObjects -eq 0) {
                   Write-Host "No objects marked for ALTER or DROP. No backup needed."
@@ -743,10 +740,6 @@ stages:
               $objectsBackedUp = 0
               $tablesCopied = 0
               
-              # --------------------------------------------------------------------------
-              # 1. Backup definitions AND create backup objects for Procs, Funcs, Views
-              # *** UPDATED *** - Now processes both ALTER and DROP statements
-              # --------------------------------------------------------------------------
               if ($scriptableObjects.Count -gt 0) {
                   Write-Host "Backing up definitions and creating live backup objects for $($scriptableObjects.Count) scriptable object(s)..."
                   $backupScriptContent += "`r`n-- ========================================`r`n"
@@ -759,11 +752,10 @@ stages:
                       $backupObjectName = "$($obj.name)_backup_$timestamp"
                       $backupFullName = "[$($obj.schema)].[$backupObjectName]"
                       $objectType = $obj.type
-                      $action = $obj.action  # Now we know if it's ALTER or DROP
+                      $action = $obj.action
                       
                       Write-Host "  Processing $action on ${objectType}: $originalFullName"
                       
-                      # Use OBJECT_ID with schema and name
                       $objectIdQuery = "SELECT OBJECT_ID('$($obj.schema).$($obj.name)')"
                       $objId = Invoke-Sqlcmd -ConnectionString $connectionString -Query $objectIdQuery -ErrorAction SilentlyContinue
                       
@@ -775,34 +767,23 @@ stages:
                               if ($result -and $result.Definition) {
                                   $definition = $result.Definition
                                   
-                                  # Add definition to the artifact script (as before)
                                   $backupScriptContent += "-- Object Definition: $originalFullName ($objectType) - Action: $action`r`n"
                                   $backupScriptContent += $definition + "`r`n"
                                   $backupScriptContent += "GO`r`n`r`n"
                                   
-                                  # --------------------------------------------------------
-                                  # NEW LOGIC: Create the live backup object in the database
-                                  # *** FIXED *** - Execute DROP and CREATE in separate batches
-                                  # --------------------------------------------------------
                                   Write-Host "    Attempting to create live backup object: $backupFullName"
 
-                                  # 1. Clean up potential existing backup (safety check) - execute in ONE batch
-                                  $dropBackupSql = @"
-                                                    IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;
-                                                    IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;
-                                                    IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;
-                                "@
+                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;`r`n"
+                                  $dropBackupSql += "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;`r`n"
+                                  $dropBackupSql += "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;"
+                                  
                                   try {
                                       Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
                                   } catch {
-                                      # Ignore errors if objects don't exist
                                   }
 
-                                  # 2. Modify the Definition Script to use the backup name
-                                  # Split definition into lines to find the object declaration line
                                   $lines = $definition -split "`r`n"
                                   
-                                  # Find and replace the CREATE/ALTER line with the backup name
                                   for ($i = 0; $i -lt $lines.Count; $i++) {
                                       if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
                                           $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE`$2$backupFullName"
@@ -811,12 +792,8 @@ stages:
                                   }
                                   
                                   $liveBackupQuery = $lines -join "`r`n"
-                                  
-                                  # Remove any GO statements from the query for procedure/function creation
-                                  # since CREATE PROCEDURE/FUNCTION must be the first statement in batch
                                   $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
                                   
-                                  # Execute the CREATE command in its own isolated batch
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
                                   $objectsBackedUp++
@@ -834,10 +811,6 @@ stages:
                   }
               }
               
-              # ----------------------------------------------------
-              # 2. Backup Tables by copying them (SELECT * INTO)
-              # *** UPDATED *** - Now processes both ALTER TABLE and DROP TABLE
-              # ----------------------------------------------------
               if ($tableObjects.Count -gt 0) {
                   Write-Host "Backing up $($tableObjects.Count) table(s) by copying..."
                   $backupScriptContent += "`r`n-- ========================================`r`n"
@@ -851,7 +824,6 @@ stages:
                       $action = $table.action
                       Write-Host "  Processing $action on table $fullName - copying to $backupTableName"
                       
-                      # Build the copy query without here-string
                       $copyQuery = "-- Backup for table $($table.schema).$($table.name) (Action: $action)`r`n"
                       $copyQuery += "IF OBJECT_ID('$($table.schema).$($table.name)', 'U') IS NOT NULL AND OBJECT_ID('$($table.schema).$($table.name)_backup_$timestamp', 'U') IS NULL`r`n"
                       $copyQuery += "BEGIN`r`n"
@@ -876,7 +848,6 @@ stages:
                       $backupScriptContent += $copyQuery
                       
                       try {
-                          # Execute the copy operation right now
                           Invoke-Sqlcmd -ConnectionString $connectionString -Query $copyQuery -QueryTimeout 300 -ErrorAction Stop
                           Write-Host "    Successfully executed copy command for $fullName (Action: $action)"
                           $tablesCopied++
@@ -962,7 +933,6 @@ stages:
               
               Write-Host "Reading SQL script..."
               $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw -Encoding UTF8
-              # Strip BOM if present
               $scriptContent = $scriptContent -replace '^\xEF\xBB\xBF', ''
               
               if ([string]::IsNullOrEmpty($scriptContent)) {
@@ -985,14 +955,13 @@ stages:
               
               Write-Host "Processing SQL script batches..."
               
-              # Split on GO (case-insensitive) that are on their own line
               $batches = @()
               $currentBatch = [System.Text.StringBuilder]::new()
               
               $lines = $scriptContent -split "`r`n|`n|`r"
               foreach ($line in $lines) {
                   $trimmedLine = $line.Trim()
-                  if ($trimmedLine -match '^(?i:GO)$') {
+                  if ($trimmedLine -match '^(?i:GO)) {
                       $batchContent = $currentBatch.ToString().Trim()
                       if ($batchContent) { $batches += $batchContent }
                       $currentBatch = [System.Text.StringBuilder]::new()
@@ -1028,10 +997,8 @@ stages:
                   try {
                       $startTime = Get-Date
                       
-                      # Clean the batch - remove BOM and trim whitespace
                       $cleanBatch = $batch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B).Trim()
                       
-                      # Each Invoke-Sqlcmd is its own batch by default
                       Invoke-Sqlcmd -ConnectionString $connectionString -Query $cleanBatch -QueryTimeout 600 -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
