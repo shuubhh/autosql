@@ -943,8 +943,6 @@ stages:
           
           try {
               # === CRITICAL FIX: Clear SQL connection pools ===
-              # This ensures we get a 100% clean connection and not a "dirty"
-              # one from the previous Backup stage, preventing the "Incorrect syntax near CREATE" error.
               Write-Host "Clearing all SQL connection pools..."
               [System.Data.SqlClient.SqlConnection]::ClearAllPools()
               Write-Host "✓ Connection pools cleared."
@@ -1005,7 +1003,7 @@ stages:
               "Execution completed in $([math]::Round($totalDuration, 2))s" | Out-File -FilePath $logFile -Append
               
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
-              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]1" # We now run as one file operation
+              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]1"
               Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration, 2))"
           }
           catch {
@@ -1019,8 +1017,11 @@ stages:
               }
               
               Write-Host "Error: $errorMessage" -ForegroundColor Red
-              "`r`n========================================" | Out-File -FilePath $logFile -Append
-              "EXECUTION FAILED: $errorMessage" | Out-File -FilePath $logFile -Append
+              
+              if (Test-Path $logFile) {
+                  "`r`n========================================" | Out-File -FilePath $logFile -Append
+                  "EXECUTION FAILED: $errorMessage" | Out-File -FilePath $logFile -Append
+              }
               
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
               Write-Host "##vso[task.logissue type=error]SQL execution failed: $errorMessage"
