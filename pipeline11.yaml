@@ -13,6 +13,8 @@ parameters:
   default: false
 - name: enableBackup
   displayName: 'Enable Backup Before Execution'
+      env:
+        USE_NEW_CONNECTION: 'true'
   type: boolean
   default: true
 - name: agentPool
@@ -35,7 +37,6 @@ stages:
   displayName: 'Download and Validate SQL Script'
   jobs:
   - job: DownloadScript
-    displayName: 'Download SQL Script from Blob Storage'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 10
@@ -575,6 +576,8 @@ stages:
 
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
+      env:
+        USE_NEW_CONNECTION: 'true'
   dependsOn: 
     - Download_And_Validate
     - Security_Review
@@ -589,6 +592,8 @@ stages:
   jobs:
   - job: CreateBackup
     displayName: 'Backup Affected Database Objects'
+      env:
+        USE_NEW_CONNECTION: 'true'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 30
@@ -605,6 +610,8 @@ stages:
     - task: AzurePowerShell@5
       name: BackupObjects
       displayName: 'Backup Affected Database Objects'
+      env:
+        USE_NEW_CONNECTION: 'true'
       inputs:
         azureSubscription: 'Azure-Connection'
         ScriptType: 'InlineScript'
@@ -692,6 +699,8 @@ stages:
                       
                       $objectIdQuery = "SELECT OBJECT_ID('$($obj.schema).$($obj.name)')"
       displayName: 'Backup Stored Procedures (separate connection)'
+      env:
+        USE_NEW_CONNECTION: 'true'
       inputs:
         targetType: 'inline'
         script: |
@@ -701,6 +710,8 @@ stages:
 
     - task: PowerShell@2
       displayName: 'Run SQL Script (separate connection)'
+      env:
+        USE_NEW_CONNECTION: 'true'
       inputs:
         targetType: 'inline'
         script: |
@@ -710,6 +721,8 @@ stages:
 
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Backup Files'
+      env:
+        USE_NEW_CONNECTION: 'true'
       condition: always()
       inputs:
         targetPath: '$(backupPath)'
@@ -732,6 +745,8 @@ stages:
   jobs:
   - job: ExecuteScript
     displayName: 'Run SQL Script'
+      env:
+        USE_NEW_CONNECTION: 'true'
     pool:
       name: ${{ parameters.agentPool }}
     timeoutInMinutes: 60
