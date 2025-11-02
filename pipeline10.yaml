@@ -1071,15 +1071,6 @@ stages:
               exit 1
           }
 
-
-    - task: PublishPipelineArtifact@1
-      displayName: 'Publish Execution Logs'
-      condition: always()
-      inputs:
-        targetPath: '$(logsPath)'
-        artifact: 'ExecutionLogs'
-        publishLocation: 'pipeline'
-
 - stage: Notify_And_Audit
   displayName: 'Notification and Audit'
   dependsOn: 
