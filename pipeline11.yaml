@@ -474,7 +474,7 @@ stages:
                           'schema': schema,
                           'name': name,
                           'type': obj_type,
-                          'action': action  # Now includes whether it's ALTER or DROP
+                          'action': action  # Now includes whether it's 'ALTER' or 'DROP'
                       })
                       unique_objects.add(obj_key)
               
@@ -680,7 +680,8 @@ stages:
           
           function Escape-SqlName {
               param([string]$name)
-              return [regex]::Escape($name).Replace('\\[', '[').Replace('\\]', ']').Replace('\\.', '.')
+              # Simple escape for regex: escape . and \
+              return $name.Replace('\', '\\').Replace('.', '\.')
           }
           
           try {
@@ -782,17 +783,26 @@ stages:
                                   } catch {
                                   }
 
-                                  $lines = $definition -split "`r`n"
+                                  # === SAFER BACKUP LOGIC ===
+                                  # 1. Replace ALTER with CREATE, case-insensitively, on the first match
+                                  $liveBackupQuery = [regex]::Replace($definition, "^\s*ALTER\s+", "CREATE ", "IgnoreCase, Multiline", 1)
+
+                                  # 2. Replace the original object name with the new backup name
+                                  #    This regex looks for [schema].[name] or schema.name or [name] or name
+                                  #    It's built to be safe and only replace the name, preserving parameters
+                                  $originalNamePattern = "(\[?$(Escape-SqlName $obj.schema)\]?\.)?\[?$(Escape-SqlName $obj.name)\]?"
+                                  $match = [regex]::Match($liveBackupQuery, $originalNamePattern, "IgnoreCase")
                                   
-                                  for ($i = 0; $i -lt $lines.Count; $i++) {
-                                      if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
-                                          $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE`$2$backupFullName"
-                                          break
-                                      }
+                                  if ($match.Success) {
+                                      # Find the *first* match and replace it
+                                      $liveBackupQuery = [regex]::Replace($liveBackupQuery, $originalNamePattern, $backupFullName, "IgnoreCase", 1)
+                                  } else {
+                                      Write-Warning "  Could not find original object name in definition to replace for backup object."
                                   }
                                   
-                                  $liveBackupQuery = $lines -join "`r`n"
-                                  $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
+                                  # 3. Remove 'GO' statements correctly (only 'GO' on its own line)
+                                  $liveBackupQuery = $liveBackupQuery -replace '(?im)^\s*GO\s*$', ''
+                                  # === END SAFER BACKUP LOGIC ===
                                   
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
@@ -1014,6 +1024,14 @@ stages:
               
               exit 1
           }
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Logs'
+      condition: always()
+      inputs:
+        targetPath: '$(logsPath)'
+        artifact: 'ExecutionLogs'
+        publishLocation: 'pipeline'
 
 - stage: Notify_And_Audit
   displayName: 'Notification and Audit'
