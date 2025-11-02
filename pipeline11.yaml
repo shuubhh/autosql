@@ -474,7 +474,7 @@ stages:
                           'schema': schema,
                           'name': name,
                           'type': obj_type,
-                          'action': action  # Now includes whether it's 'ALTER' or 'DROP'
+                          'action': action  # Now includes whether it's ALTER or DROP
                       })
                       unique_objects.add(obj_key)
               
@@ -639,6 +639,8 @@ stages:
         instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
         onTimeout: 'reject'
 
+---
+
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
   dependsOn: 
@@ -783,7 +785,7 @@ stages:
                                   } catch {
                                   }
 
-                                  # === SAFER BACKUP LOGIC ===
+                                  # === SAFER BACKUP LOGIC (Restored from previous stable version) ===
                                   # 1. Replace ALTER with CREATE, case-insensitively, on the first match
                                   $liveBackupQuery = [regex]::Replace($definition, "^\s*ALTER\s+", "CREATE ", "IgnoreCase, Multiline", 1)
 
@@ -897,6 +899,8 @@ stages:
         targetPath: '$(backupPath)'
         artifact: 'DatabaseBackup'
         publishLocation: 'pipeline'
+
+---
 
 - stage: Execute_SQL_Script
   displayName: 'Execute SQL Script'
@@ -1031,6 +1035,8 @@ stages:
         targetPath: '$(logsPath)'
         artifact: 'ExecutionLogs'
         publishLocation: 'pipeline'
+
+---
 
 - stage: Notify_And_Audit
   displayName: 'Notification and Audit'
