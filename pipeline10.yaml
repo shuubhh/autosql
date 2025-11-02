@@ -959,7 +959,9 @@ stages:
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
               
               Write-Host "Reading SQL script..."
-              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw
+              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw -Encoding UTF8
+              # Strip BOM if present
+              $scriptContent = $scriptContent -replace '^\xEF\xBB\xBF', ''
               
               if ([string]::IsNullOrEmpty($scriptContent)) {
                   throw "SQL script is empty"
@@ -979,13 +981,8 @@ stages:
               
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              # FIXED: Enhanced batch processing with proper isolation
               Write-Host "Processing SQL script batches..."
               
-              # Clean the script content first - remove any BOM or special characters
-              $scriptContent = $scriptContent.Trim()
-              
-              # Method 1: Use a more reliable batch splitting approach
               # Split on GO (case-insensitive) that are on their own line
               $batches = @()
               $currentBatch = [System.Text.StringBuilder]::new()
@@ -993,32 +990,18 @@ stages:
               $lines = $scriptContent -split "`r`n|`n|`r"
               foreach ($line in $lines) {
                   $trimmedLine = $line.Trim()
-                  
-                  # Check if this line is a GO statement (case-insensitive)
-                  if ($trimmedLine -eq 'GO' -or $trimmedLine -eq 'go' -or $trimmedLine -eq 'Go') {
-                      # Finalize current batch if it has content
+                  if ($trimmedLine -match '^(?i:GO)$') {
                       $batchContent = $currentBatch.ToString().Trim()
-                      if (-not [string]::IsNullOrWhiteSpace($batchContent)) {
-                          $batches += $batchContent
-                      }
-                      # Reset for next batch
+                      if ($batchContent) { $batches += $batchContent }
                       $currentBatch = [System.Text.StringBuilder]::new()
                   } else {
-                      # Add line to current batch (with original line ending)
-                      if ($currentBatch.Length -gt 0) {
-                          $currentBatch.AppendLine() | Out-Null
-                      }
+                      if ($currentBatch.Length -gt 0) { $currentBatch.AppendLine() | Out-Null }
                       $currentBatch.Append($line) | Out-Null
                   }
               }
-              
-              # Add the final batch if it has content
               $finalBatch = $currentBatch.ToString().Trim()
-              if (-not [string]::IsNullOrWhiteSpace($finalBatch)) {
-                  $batches += $finalBatch
-              }
+              if ($finalBatch) { $batches += $finalBatch }
               
-              # If no batches found (no GO statements), treat entire script as one batch
               if ($batches.Count -eq 0) {
                   Write-Host "No GO statements found, treating entire script as one batch"
                   $batches = @($scriptContent.Trim())
@@ -1029,14 +1012,9 @@ stages:
               $executedCount = 0
               $totalDuration = [TimeSpan]::Zero
               
-              # Execute each batch separately with proper isolation
               for ($i = 0; $i -lt $batches.Count; $i++) {
                   $batch = $batches[$i].Trim()
-                  
-                  if ([string]::IsNullOrWhiteSpace($batch)) {
-                      Write-Host "Skipping empty batch $($i + 1)"
-                      continue
-                  }
+                  if (-not $batch) { continue }
                   
                   $batchNumber = $i + 1
                   $preview = if ($batch.Length -gt 150) { $batch.Substring(0, 150) + "..." } else { $batch }
@@ -1045,37 +1023,12 @@ stages:
                   Write-Host "Executing batch $batchNumber of $($batches.Count)"
                   Write-Host "Preview: $preview"
                   
-                  $timeStamp = Get-Date -Format "HH:mm:ss"
-                  "Batch $batchNumber - $timeStamp" | Out-File -FilePath $logFile -Append
-                  "Preview: $preview" | Out-File -FilePath $logFile -Append
-                  
                   try {
                       $startTime = Get-Date
                       
-                      Write-Host "Executing batch (length: $($batch.Length) characters)..."
+                      # Only trim BOM/invisible chars, do NOT regex-rewrite CREATE/ALTER
+                      $cleanBatch = $batch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B)
                       
-                      # FIXED: Enhanced batch execution with proper error handling
-                      # For CREATE/ALTER PROCEDURE statements, ensure they're properly isolated
-                      $cleanBatch = $batch
-                      
-                      # Remove any potential problematic characters or BOM
-                      $cleanBatch = $cleanBatch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B)
-                      
-                      # Ensure the batch starts with a valid SQL statement
-                      if ($cleanBatch -match '^\s*(CREATE|ALTER)\s+(PROCEDURE|FUNCTION)') {
-                          Write-Host "  Detected CREATE/ALTER PROCEDURE/FUNCTION - ensuring clean execution"
-                          
-                          # Remove any comments or problematic whitespace at the beginning
-                          $cleanBatch = $cleanBatch.Trim()
-                          
-                          # Ensure it starts exactly with CREATE or ALTER
-                          if ($cleanBatch -notmatch '^(CREATE|ALTER)') {
-                              # Extract just the CREATE/ALTER statement part
-                              $cleanBatch = $cleanBatch -replace '^.*?(CREATE|ALTER)', '$1'
-                          }
-                      }
-                      
-                      Write-Host "  Executing cleaned batch..."
                       Invoke-Sqlcmd -ConnectionString $connectionString -Query $cleanBatch -QueryTimeout 600 -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
@@ -1091,17 +1044,8 @@ stages:
                       Write-Host $errorMsg -ForegroundColor Red
                       "$errorMsg`n" | Out-File -FilePath $logFile -Append
                       
-                      # Enhanced error information
                       Write-Host "Full batch content:" -ForegroundColor Yellow
                       Write-Host $batch -ForegroundColor Yellow
-                      Write-Host "Batch length: $($batch.Length) characters" -ForegroundColor Yellow
-                      
-                      # Check for invisible characters
-                      Write-Host "First 10 characters (hex):" -ForegroundColor Yellow
-                      $firstChars = $batch.Substring(0, [Math]::Min(10, $batch.Length))
-                      foreach ($char in $firstChars.ToCharArray()) {
-                          Write-Host "  '$char' = 0x$([Convert]::ToString([int]$char, 16).PadLeft(4, '0'))" -ForegroundColor Yellow
-                      }
                       
                       throw "SQL execution failed at batch $batchNumber"
                   }
@@ -1112,10 +1056,9 @@ stages:
               Write-Host "Batches executed: $executedCount" -ForegroundColor Green
               Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
               
-              $roundedDuration = [math]::Round($totalDuration.TotalSeconds, 2)
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
               Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
-              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$roundedDuration"
+              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration.TotalSeconds, 2))"
           }
           catch {
               Write-Host ""
@@ -1127,6 +1070,7 @@ stages:
               
               exit 1
           }
+
 
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Execution Logs'
