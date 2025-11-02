@@ -782,19 +782,21 @@ stages:
                                   
                                   # --------------------------------------------------------
                                   # NEW LOGIC: Create the live backup object in the database
-                                  # *** FIXED *** - Remove GO statements and handle batch execution properly
+                                  # *** FIXED *** - Execute DROP and CREATE in separate batches
                                   # --------------------------------------------------------
                                   Write-Host "    Attempting to create live backup object: $backupFullName"
 
-                                  # 1. Clean up potential existing backup (safety check) - execute separately
-                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;"
-                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
-                                  
-                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;"
-                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
-                                  
-                                  $dropBackupSql = "IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;"
-                                  Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  # 1. Clean up potential existing backup (safety check) - execute in ONE batch
+                                  $dropBackupSql = @"
+                                                    IF OBJECT_ID('$backupFullName', 'P') IS NOT NULL DROP PROCEDURE $backupFullName;
+                                                    IF OBJECT_ID('$backupFullName', 'FN') IS NOT NULL DROP FUNCTION $backupFullName;
+                                                    IF OBJECT_ID('$backupFullName', 'V') IS NOT NULL DROP VIEW $backupFullName;
+                                "@
+                                  try {
+                                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $dropBackupSql -ErrorAction SilentlyContinue
+                                  } catch {
+                                      # Ignore errors if objects don't exist
+                                  }
 
                                   # 2. Modify the Definition Script to use the backup name
                                   # Split definition into lines to find the object declaration line
@@ -814,7 +816,7 @@ stages:
                                   # since CREATE PROCEDURE/FUNCTION must be the first statement in batch
                                   $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
                                   
-                                  # Execute the CREATE command in its own batch
+                                  # Execute the CREATE command in its own isolated batch
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
                                   $objectsBackedUp++
@@ -1026,9 +1028,10 @@ stages:
                   try {
                       $startTime = Get-Date
                       
-                      # Only trim BOM/invisible chars, do NOT regex-rewrite CREATE/ALTER
-                      $cleanBatch = $batch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B)
+                      # Clean the batch - remove BOM and trim whitespace
+                      $cleanBatch = $batch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B).Trim()
                       
+                      # Each Invoke-Sqlcmd is its own batch by default
                       Invoke-Sqlcmd -ConnectionString $connectionString -Query $cleanBatch -QueryTimeout 600 -ErrorAction Stop
                       
                       $duration = (Get-Date) - $startTime
@@ -1070,6 +1073,14 @@ stages:
               
               exit 1
           }
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Logs'
+      condition: always()
+      inputs:
+        targetPath: '$(logsPath)'
+        artifact: 'ExecutionLogs'
+        publishLocation: 'pipeline'
 
 - stage: Notify_And_Audit
   displayName: 'Notification and Audit'
