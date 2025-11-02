@@ -631,15 +631,10 @@ stages:
     timeoutInMinutes: 1440
     
     steps:
-    
-    - task: ManualValidation@1
+    - task: ManualValidation@0
       inputs:
-        notifyUsers: 'shubh.bhanushali@g7cr.com'
-        approvers: 'shubh.bhanushali@g7cr.com'
-        instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
+        instructions: 'Security issues or warnings were found in the SQL script. Please review the validation report and approve or reject the execution.'
         onTimeout: 'reject'
-
----
 
 - stage: Backup_Database_Objects
   displayName: 'Backup User Database Objects'
@@ -648,8 +643,7 @@ stages:
     - Security_Review
   condition: |
     and(
-      not(failed()),
-      not(canceled()),
+      succeeded(),
       eq('${{ parameters.enableBackup }}', 'true'),
       eq('${{ parameters.dryRun }}', 'false')
     )
@@ -785,13 +779,11 @@ stages:
                                   } catch {
                                   }
 
-                                  # === SAFER BACKUP LOGIC (Restored from previous stable version) ===
+                                  # === SAFER BACKUP LOGIC ===
                                   # 1. Replace ALTER with CREATE, case-insensitively, on the first match
                                   $liveBackupQuery = [regex]::Replace($definition, "^\s*ALTER\s+", "CREATE ", "IgnoreCase, Multiline", 1)
 
                                   # 2. Replace the original object name with the new backup name
-                                  #    This regex looks for [schema].[name] or schema.name or [name] or name
-                                  #    It's built to be safe and only replace the name, preserving parameters
                                   $originalNamePattern = "(\[?$(Escape-SqlName $obj.schema)\]?\.)?\[?$(Escape-SqlName $obj.name)\]?"
                                   $match = [regex]::Match($liveBackupQuery, $originalNamePattern, "IgnoreCase")
                                   
@@ -804,7 +796,6 @@ stages:
                                   
                                   # 3. Remove 'GO' statements correctly (only 'GO' on its own line)
                                   $liveBackupQuery = $liveBackupQuery -replace '(?im)^\s*GO\s*$', ''
-                                  # === END SAFER BACKUP LOGIC ===
                                   
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
@@ -900,8 +891,6 @@ stages:
         artifact: 'DatabaseBackup'
         publishLocation: 'pipeline'
 
----
-
 - stage: Execute_SQL_Script
   displayName: 'Execute SQL Script'
   dependsOn: 
@@ -910,8 +899,7 @@ stages:
     - Backup_Database_Objects
   condition: |
     and(
-      not(failed()),
-      not(canceled()),
+      succeeded(),
       eq('${{ parameters.dryRun }}', 'false')
     )
   
@@ -942,7 +930,7 @@ stages:
           $ErrorActionPreference = "Stop"
           
           try {
-              # === CRITICAL FIX: Clear SQL connection pools ===
+              # Clear SQL connection pools
               Write-Host "Clearing all SQL connection pools..."
               [System.Data.SqlClient.SqlConnection]::ClearAllPools()
               Write-Host "✓ Connection pools cleared."
@@ -981,7 +969,6 @@ stages:
 
               $startTime = Get-Date
               
-              # === CORRECT EXECUTION LOGIC ===
               # Use -InputFile parameter, which correctly parses 'GO' separators
               Invoke-Sqlcmd `
                   -ConnectionString $connectionString `
@@ -990,7 +977,6 @@ stages:
                   -ErrorAction Stop `
                   -OutputSqlErrors $true `
                   | Out-File -FilePath $logFile -Append
-              # === END CORRECT EXECUTION LOGIC ===
               
               $duration = (Get-Date) - $startTime
               $totalDuration = $duration.TotalSeconds
@@ -1036,8 +1022,6 @@ stages:
         targetPath: '$(logsPath)'
         artifact: 'ExecutionLogs'
         publishLocation: 'pipeline'
-
----
 
 - stage: Notify_And_Audit
   displayName: 'Notification and Audit'
