@@ -938,14 +938,12 @@ stages:
           $ErrorActionPreference = "Stop"
           
           try {
-              # === NEW FIX ===
-              # Clear all SQL connection pools for this agent.
+              # === CRITICAL FIX: Clear SQL connection pools ===
               # This ensures we get a 100% clean connection and not a "dirty"
-              # one from the previous Backup stage.
+              # one from the previous Backup stage, preventing the "Incorrect syntax near CREATE" error.
               Write-Host "Clearing all SQL connection pools..."
               [System.Data.SqlClient.SqlConnection]::ClearAllPools()
               Write-Host "✓ Connection pools cleared."
-              # === END FIX ===
               
               Write-Host "Retrieving connection string..."
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
@@ -981,8 +979,8 @@ stages:
 
               $startTime = Get-Date
               
+              # === CORRECT EXECUTION LOGIC ===
               # Use -InputFile parameter, which correctly parses 'GO' separators
-              # All output and errors will be streamed to the log file.
               Invoke-Sqlcmd `
                   -ConnectionString $connectionString `
                   -InputFile $scriptFile `
@@ -990,6 +988,7 @@ stages:
                   -ErrorAction Stop `
                   -OutputSqlErrors $true `
                   | Out-File -FilePath $logFile -Append
+              # === END CORRECT EXECUTION LOGIC ===
               
               $duration = (Get-Date) - $startTime
               $totalDuration = $duration.TotalSeconds
