@@ -664,6 +664,19 @@ stages:
         artifact: 'ValidationReport'
         path: '$(Pipeline.Workspace)/sql'
 
+    - task: PowerShell@2
+      displayName: 'Debug Variables'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "--- DEBUGGING ---"
+          Write-Host "Value of $(secretName) is: [$(secretName)]"
+          Write-Host "Value of $(keyVaultName) is: [$(keyVaultName)]"
+          
+          Write-Host "--- ALL MAPPED ENV VARS ---"
+          Get-ChildItem -Path Env: | Sort-Object Name | Format-Table -AutoSize
+          Write-Host "--- END DEBUG ---"
+
     - task: PythonScript@0
       name: BackupWithSQLAlchemy
       displayName: 'Backup Objects with SQLAlchemy'
