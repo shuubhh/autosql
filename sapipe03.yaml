@@ -696,7 +696,7 @@ stages:
                   )
                   
                   secret = secret_client.get_secret(secret_name)
-                  print("✓ Successfully retrieved connection string from Key Vault")
+                  print(" Successfully retrieved connection string from Key Vault")
                   return secret.value
                   
               except Exception as e:
