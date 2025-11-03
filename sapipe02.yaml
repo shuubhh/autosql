@@ -999,7 +999,7 @@ stages:
               sys.exit(0 if success else 1)
       env:
         KEYVAULT_NAME: $(keyVaultName)
-        SECRET_NAME: sql-conn-string
+        SECRET_NAME: $(secretName)
         AFFECTED_OBJECTS_PATH: $(Pipeline.Workspace)/sql/affected_objects.json
         BACKUP_PATH: $(backupPath)
         SCRIPT_NAME: ${{ parameters.sqlScriptName }}
