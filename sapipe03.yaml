@@ -1,0 +1,1361 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger: none # Manual trigger only
+
+parameters:
+- name: sqlScriptName
+  displayName: 'SQL Script Name'
+  type: string
+  default: 'script.sql'
+- name: dryRun
+  displayName: 'Dry Run (Validation Only)'
+  type: boolean
+  default: false
+- name: enableBackup
+  displayName: 'Enable Backup Before Execution'
+  type: boolean
+  default: true
+- name: agentPool
+  displayName: 'Agent Pool'
+  type: string
+  default: 'self1'
+
+variables:
+  sqlScriptPath: '$(Pipeline.Workspace)/sql/${{ parameters.sqlScriptName }}'
+  backupPath: '$(Pipeline.Workspace)/backup'
+  logsPath: '$(Pipeline.Workspace)/logs'
+  storageAccountName: 'sqlautostacc'
+  containerName: 'rawsql'
+  backupContainerName: 'backups'
+  keyVaultName: 'sql-validator-kv'
+  secretName: 'sql-conn-string'
+
+stages:
+- stage: Download_And_Validate
+  displayName: 'Download and Validate SQL Script'
+  jobs:
+  - job: DownloadScript
+    displayName: 'Download SQL Script from Blob Storage'
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 10
+    
+    steps:
+    - checkout: none
+    
+    - task: PowerShell@2
+      displayName: 'Verify Agent Prerequisites'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Checking agent prerequisites..."
+          
+          # Check PowerShell version
+          $psVersion = $PSVersionTable.PSVersion
+          Write-Host "PowerShell Version: $psVersion"
+          if ($psVersion.Major -lt 5) {
+              Write-Error "PowerShell 5.0 or higher required"
+              exit 1
+          }
+          
+          # Check Python and install dependencies
+          try {
+              $pythonVersion = python --version 2>&1
+              Write-Host "Python: $pythonVersion"
+              
+              # Install required Python packages
+              Write-Host "Installing Python dependencies..."
+              python -m pip install --upgrade pip
+              pip install sqlalchemy pyodbc sqlparse==0.4.4 azure-identity azure-keyvault-secrets azure-storage-blob
+              
+              # Verify installations
+              pip list | findstr "sqlalchemy pyodbc sqlparse azure"
+              
+          } catch {
+              Write-Error "Python setup failed: $($_.Exception.Message)"
+              exit 1
+          }
+          
+          # Check Az PowerShell module (still needed for blob storage)
+          $azModule = Get-Module -ListAvailable -Name Az.Accounts, Az.KeyVault, Az.Storage
+          if (-not $azModule) {
+              Write-Host "Installing Az PowerShell modules..."
+              Install-Module -Name Az.Accounts, Az.KeyVault, Az.Storage -Force -AllowClobber -Scope CurrentUser
+          }
+          
+          Write-Host "✓ Prerequisites verified"
+
+    - task: AzurePowerShell@5
+      displayName: 'Download SQL Script from Blob'
+      inputs:
+        azureSubscription: 'Azure-Connection'
+        ScriptType: 'InlineScript'
+        azurePowerShellVersion: 'LatestVersion'
+        Inline: |
+          $ErrorActionPreference = "Stop"
+          
+          try {
+              Write-Host "Creating directory structure..."
+              New-Item -ItemType Directory -Force -Path "$(Pipeline.Workspace)/sql" | Out-Null
+              
+              Write-Host "Downloading script: ${{ parameters.sqlScriptName }}"
+              
+              # Get storage account context
+              $storageAccount = Get-AzStorageAccount | Where-Object { $_.StorageAccountName -eq "$(storageAccountName)" }
+              
+              if (-not $storageAccount) {
+                  throw "Storage account '$(storageAccountName)' not found"
+              }
+              
+              $ctx = $storageAccount.Context
+              
+              # Download blob
+              Get-AzStorageBlobContent `
+                  -Container "$(containerName)" `
+                  -Blob "${{ parameters.sqlScriptName }}" `
+                  -Destination "$(sqlScriptPath)" `
+                  -Context $ctx `
+                  -Force
+              
+              if (-not (Test-Path "$(sqlScriptPath)")) {
+                  throw "Failed to download SQL script"
+              }
+              
+              $fileSize = (Get-Item "$(sqlScriptPath)").Length
+              Write-Host "✓ Script downloaded successfully ($fileSize bytes)"
+              Write-Host "Script location: $(sqlScriptPath)"
+              Get-Content "$(sqlScriptPath)" -TotalCount 5 | ForEach-Object { Write-Host "  $_" }
+          }
+          catch {
+              Write-Error "Download failed: $($_.Exception.Message)"
+              exit 1
+          }
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish SQL Script'
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/sql'
+        artifact: 'SQLScript'
+        publishLocation: 'pipeline'
+
+  - job: ValidateScript
+    displayName: 'Syntax and Security Validation'
+    dependsOn: DownloadScript
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 15
+    
+    steps:
+    - checkout: none
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SQL Script Artifact'
+      inputs:
+        artifact: 'SQLScript'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: PythonScript@0
+      name: SQLValidation
+      displayName: 'SQL Syntax and Security Validation'
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import sqlparse
+          import sys
+          import os
+          import re
+          import json
+
+          # Debug: Print environment variables and check paths
+          print("=== DEBUG INFORMATION ===")
+          print("Environment Variables:")
+          for key, value in sorted(os.environ.items()):
+              if any(term in key for term in ['WORK', 'AGENT', 'PIPELINE', 'BUILD', 'SCRIPT', 'SYSTEM']):
+                  print(f"  {key}: {value}")
+
+          # Get paths from environment variables
+          pipeline_workspace = os.environ.get('PIPELINE_WORKSPACE')
+          sql_script_path = os.environ.get('SQL_SCRIPT_PATH')
+
+          print(f"\nPipeline Workspace from env: {pipeline_workspace}")
+          print(f"SQL Script Path from env: {sql_script_path}")
+
+          # If environment variables are not set, try alternative approaches
+          if not pipeline_workspace:
+              print("PIPELINE_WORKSPACE not found in environment, trying alternatives...")
+              possible_workspaces = [
+                  os.environ.get('AGENT_WORKFOLDER'),
+                  os.environ.get('SYSTEM_DEFAULTWORKINGDIRECTORY'),
+                  os.path.abspath('.')
+              ]
+              for workspace in possible_workspaces:
+                  if workspace and os.path.exists(workspace):
+                      pipeline_workspace = workspace
+                      print(f"Using alternative workspace: {pipeline_workspace}")
+                      break
+
+          if not sql_script_path:
+              print("SQL_SCRIPT_PATH not found in environment, constructing path...")
+              if pipeline_workspace:
+                  sql_script_path = os.path.join(pipeline_workspace, 'sql', os.path.basename(os.environ.get('SQL_SCRIPT_NAME_PARAM', 'script.sql')))
+                  print(f"Constructed script path: {sql_script_path}")
+
+          # Normalize paths
+          if pipeline_workspace:
+              report_dir = os.path.join(pipeline_workspace, 'sql')
+          else:
+              report_dir = 'sql'  # Fallback
+              
+          script_path = sql_script_path
+
+          print(f"\nFinal Paths:")
+          print(f"Report Directory: {report_dir}")
+          print(f"Script Path: {script_path}")
+
+          # Check if script file exists
+          print(f"\nFile Check:")
+          print(f"Script exists: {os.path.exists(script_path) if script_path else 'No path'}")
+          if script_path and os.path.exists(script_path):
+              print(f"Script size: {os.path.getsize(script_path)} bytes")
+              # Show first few lines of the script
+              try:
+                  with open(script_path, 'r', encoding='utf-8') as f:
+                      first_lines = []
+                      for _ in range(5):
+                          line = f.readline()
+                          if not line:
+                              break
+                          first_lines.append(line.strip())
+                  print(f"First lines: {first_lines}")
+              except Exception as e:
+                  print(f"Error reading script: {e}")
+          else:
+              # List files in possible locations
+              print("Searching for SQL files...")
+              search_dirs = [pipeline_workspace, 'sql', '.', os.path.join(pipeline_workspace, 'sql') if pipeline_workspace else 'sql']
+              for search_dir in search_dirs:
+                  if search_dir and os.path.exists(search_dir):
+                      print(f"Files in {search_dir}:")
+                      try:
+                          for file in os.listdir(search_dir):
+                              if file.endswith('.sql'):
+                                  print(f"  - {file}")
+                      except Exception as e:
+                          print(f"  Error listing: {e}")
+
+          print("=== END DEBUG ===\n")
+
+          # Validate that we have a script path
+          if not script_path or not os.path.exists(script_path):
+              print("##vso[task.logissue type=error]SQL script not found")
+              print(f"##vso[task.logissue type=error]Expected path: {script_path}")
+              sys.exit(1)
+
+          def validate_sql_syntax(file_path):
+              try:
+                  with open(file_path, 'r', encoding='utf-8') as f:
+                      sql_content = f.read()
+                  
+                  if not sql_content.strip():
+                      print("##vso[task.logissue type=error]SQL file is empty")
+                      return False
+                  
+                  parsed = sqlparse.parse(sql_content)
+                  if not parsed:
+                      print("##vso[task.logissue type=error]Failed to parse SQL content")
+                      return False
+                  
+                  print("Basic SQL syntax is valid")
+                  print(f"  Found {len(parsed)} SQL statement(s)")
+                  return True
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]SQL Syntax Error: {e}")
+                  return False
+
+          def extract_table_name_from_dml(statement):
+              """
+              Extract table name from UPDATE/DELETE statements - FIXED VERSION
+              """
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
+              
+              # Pattern for UPDATE table_name - more specific
+              update_match = re.search(r'\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if update_match:
+                  return update_match.group(1)
+              
+              # Pattern for DELETE FROM table_name or DELETE table_name - more specific
+              delete_match = re.search(r'\bDELETE\s+(?:FROM\s+)?([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if delete_match:
+                  return delete_match.group(1)
+              
+              return None
+
+          def extract_table_name_from_alter(statement):
+              """
+              Extract table name from ALTER TABLE statements - FIXED VERSION
+              """
+              # Clean the statement first to remove comments and strings
+              clean_stmt = re.sub(r'--.*$', '', statement, flags=re.MULTILINE)
+              clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+              clean_stmt = re.sub(r"'.*?'", "''", clean_stmt)
+              clean_stmt = re.sub(r'"."?"', '""', clean_stmt)
+              
+              # Pattern for ALTER TABLE - more specific and avoids capturing 'ALTER' as table name
+              alter_match = re.search(r'\bALTER\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', clean_stmt, re.IGNORECASE)
+              if alter_match:
+                  return alter_match.group(1)
+              
+              return None
+
+          def check_security_policies(file_path):
+              with open(file_path, 'r', encoding='utf-8') as f:
+                  sql_content = f.read()
+              
+              issues = []
+              warnings = []
+              
+              statements = sqlparse.parse(sql_content)
+              
+              for i, stmt in enumerate(statements):
+                  stmt_str = str(stmt).strip()
+                  if not stmt_str:
+                      continue
+                  
+                  stmt_upper = stmt_str.upper()
+                  stmt_num = i + 1
+                  
+                  # Check for UPDATE without WHERE clause in any SQL statement
+                  if 'UPDATE' in stmt_upper:
+                      # Remove comments and strings to avoid false positives
+                      clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
+                      clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+                      clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
+                      
+                      # Check if UPDATE has WHERE clause
+                      if 'UPDATE' in clean_stmt and 'WHERE' not in clean_stmt:
+                          table_name = extract_table_name_from_dml(stmt_str)
+                          table_info = f" on table '{table_name}'" if table_name else ""
+                          issues.append(f"Statement {stmt_num}: UPDATE without WHERE clause{table_info}")
+                  
+                  # Check for DELETE without WHERE clause in any SQL statement
+                  if 'DELETE' in stmt_upper:
+                      # Remove comments and strings to avoid false positives
+                      clean_stmt = re.sub(r'--.*$', '', stmt_upper, flags=re.MULTILINE)
+                      clean_stmt = re.sub(r'/\*.*?\*/', '', clean_stmt, flags=re.DOTALL)
+                      clean_stmt = re.sub(r"'.*?'", '', clean_stmt)
+                      clean_stmt = re.sub(r'"."?"', '', clean_stmt)
+                      
+                      # Check if DELETE has WHERE clause
+                      if 'DELETE' in clean_stmt and 'WHERE' not in clean_stmt:
+                          table_name = extract_table_name_from_dml(stmt_str)
+                          table_info = f" on table '{table_name}'" if table_name else ""
+                          issues.append(f"Statement {stmt_num}: DELETE without WHERE clause{table_info}")
+                  
+                  # Check for dangerous DROP operations with enhanced pattern matching
+                  dangerous_drops = [
+                      ('DROP TABLE', 'TABLE'),
+                      ('DROP DATABASE', 'DATABASE'), 
+                      ('DROP SCHEMA', 'SCHEMA'),
+                      ('DROP PROCEDURE', 'PROCEDURE'),
+                      ('DROP FUNCTION', 'FUNCTION'),
+                      ('DROP VIEW', 'VIEW')
+                  ]
+                  
+                  for drop_op, obj_type in dangerous_drops:
+                      if drop_op in stmt_upper:
+                          # Extract object name after DROP operation - FIXED regex
+                          obj_match = re.search(rf'{re.escape(drop_op)}\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', stmt_upper, re.IGNORECASE)
+                          if obj_match:
+                              obj_info = f" '{obj_match.group(1)}'"
+                          else:
+                              obj_info = ""
+                          issues.append(f"Statement {stmt_num}: Dangerous operation - {drop_op}{obj_info}")
+                  
+                  # Check for TRUNCATE TABLE
+                  if 'TRUNCATE TABLE' in stmt_upper or re.search(r'\bTRUNCATE\s+TABLE\b', stmt_upper):
+                      # Extract table name after TRUNCATE TABLE - FIXED regex
+                      table_match = re.search(r'TRUNCATE\s+TABLE\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b', stmt_upper, re.IGNORECASE)
+                      if table_match:
+                          table_info = f" '{table_match.group(1)}'"
+                      else:
+                          table_info = ""
+                      issues.append(f"Statement {stmt_num}: TRUNCATE TABLE detected{table_info}")
+                  
+                  # Enhanced ALTER TABLE detection - FIXED to trigger approval
+                  if 'ALTER TABLE' in stmt_upper:
+                      table_name = extract_table_name_from_alter(stmt_str)
+                      table_info = f" '{table_name}'" if table_name else ""
+                      
+                      # Check what type of ALTER operation - ALL marked as ISSUES to trigger approval
+                      if re.search(r'\bADD\s+(?!CONSTRAINT)\w+', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE ADD COLUMN operation{table_info}")
+                      elif re.search(r'\bDROP\s+COLUMN\b', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE DROP COLUMN operation{table_info}")
+                      elif re.search(r'\bALTER\s+COLUMN\b', stmt_upper, re.IGNORECASE):
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE MODIFY COLUMN operation{table_info}")
+                      else:
+                          issues.append(f"Statement {stmt_num}: ALTER TABLE operation{table_info}")
+                  
+                  # Check for ALTER PROCEDURE/FUNCTION/VIEW - trigger approval
+                  if re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\b', stmt_upper, re.IGNORECASE):
+                      match = re.search(r'\bALTER\s+(PROCEDURE|FUNCTION|VIEW)\s+([a-zA-Z_\[\]\.][a-zA-Z0-9_\[\]\.]*)', stmt_upper, re.IGNORECASE)
+                      if match:
+                          obj_type = match.group(1)
+                          obj_name = match.group(2)
+                          issues.append(f"Statement {stmt_num}: ALTER {obj_type} operation '{obj_name}'")
+                  
+                  # Check for Dynamic SQL (warning only)
+                  if re.search(r'\bEXEC\s*\(|\bEXECUTE\s*\(|\bSP_EXECUTESQL\b', stmt_upper):
+                      warnings.append(f"Statement {stmt_num}: Dynamic SQL detected")
+              
+              return issues, warnings
+
+          # *** UPDATED FUNCTION ***
+          # Now detects BOTH DROP and ALTER statements for backup
+          def extract_affected_objects(file_path):
+              with open(file_path, 'r', encoding='utf-8') as f:
+                  sql_content = f.read()
+
+              # Remove comments to avoid false positives
+              sql_content = re.sub(r'--.*$', '', sql_content, flags=re.MULTILINE)
+              sql_content = re.sub(r'/\*.*?\*/', '', sql_content, flags=re.DOTALL)
+              
+              objects_to_backup = []
+              
+              # *** UPDATED REGEX *** - Now matches BOTH ALTER and DROP
+              # Regex to find ALTER or DROP commands for procedures, functions, views, or tables
+              # Group 1: ALTER or DROP
+              # Group 2: PROCEDURE, FUNCTION, VIEW, TABLE
+              # Group 3: Object name (e.g., [dbo].[myProc], dbo.myProc, [myProc], myProc)
+              pattern = re.compile(
+                  r'\b(ALTER|DROP)\s+(PROCEDURE|FUNCTION|VIEW|TABLE)\s+((?:\[[^\]]+\]|[\w\d_]+)\.(?:\[[^\]]+\]|[\w\d_]+)|(?:\[[^\]]+\]|[\w\d_]+))',
+                  re.IGNORECASE | re.MULTILINE
+              )
+              
+              # Keep track of unique objects to avoid duplicates
+              unique_objects = set()
+
+              for match in pattern.finditer(sql_content):
+                  action = match.group(1).upper()  # Now captures 'ALTER' or 'DROP'
+                  obj_type = match.group(2).upper()
+                  full_name = match.group(3)
+                  
+                  # Parse schema and name
+                  schema = 'dbo' # Default schema
+                  name = full_name
+                  
+                  if '.' in full_name:
+                      parts = full_name.split('.')
+                      # Handle [schema].[object]
+                      schema = parts[0].strip().strip('[]')
+                      name = '.'.join(parts[1:]).strip().strip('[]') # Handle names with dots if any (unlikely but safe)
+                  else:
+                      name = full_name.strip().strip('[]')
+                  
+                  # Create a unique key for this object
+                  obj_key = (schema.lower(), name.lower(), obj_type)
+                  
+                  if obj_key not in unique_objects:
+                      objects_to_backup.append({
+                          'schema': schema,
+                          'name': name,
+                          'type': obj_type,
+                          'action': action  # Now includes whether it's ALTER or DROP
+                      })
+                      unique_objects.add(obj_key)
+              
+              # Separate scriptable objects (proc, func, view) from tables
+              scriptable_objects = [obj for obj in objects_to_backup if obj['type'] in ('PROCEDURE', 'FUNCTION', 'VIEW')]
+              table_objects = [obj for obj in objects_to_backup if obj['type'] == 'TABLE']
+
+              # This is for the human-readable text report
+              affected_report = {
+                  'procedures': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'PROCEDURE'])),
+                  'functions': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'FUNCTION'])),
+                  'views': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in scriptable_objects if obj['type'] == 'VIEW'])),
+                  'tables': list(set([f"{obj['schema']}.{obj['name']} ({obj['action']})" for obj in table_objects]))
+              }
+
+              # This is the JSON data that will be used by the backup stage
+              backup_data = {
+                  'scriptableObjects': scriptable_objects,
+                  'tableObjects': table_objects
+              }
+              
+              return backup_data, affected_report
+
+          # *** MODIFIED FUNCTION ***
+          # Now saves the correct JSON for the backup stage
+          def generate_report(file_path, syntax_ok, issues, warnings, affected_report_data, backup_json_data, report_dir):
+              # Use the report_dir we defined earlier
+              os.makedirs(report_dir, exist_ok=True)
+              report_path = os.path.join(report_dir, 'validation_report.txt')
+              
+              # Use UTF-8 encoding to handle special characters
+              with open(report_path, 'w', encoding='utf-8') as f:
+                  f.write("=" * 70 + "\n")
+                  f.write("SQL VALIDATION REPORT\n")
+                  f.write("=" * 70 + "\n\n")
+                  f.write(f"Script: {os.path.basename(file_path)}\n")
+                  f.write(f"Syntax Valid: {'YES' if syntax_ok else 'NO'}\n\n")
+                  
+                  # Use the affected_report_data for the text report
+                  affected = affected_report_data
+                  if any(affected.values()):
+                      f.write("AFFECTED DATABASE OBJECTS (from ALTER or DROP):\n")
+                      f.write("-" * 70 + "\n")
+                      if affected['procedures']:
+                          f.write(f"  Procedures: {', '.join(set(affected['procedures']))}\n")
+                      if affected['functions']:
+                          f.write(f"  Functions: {', '.join(set(affected['functions']))}\n")
+                      if affected['views']:
+                          f.write(f"  Views: {', '.join(set(affected['views']))}\n")
+                      if affected['tables']:
+                          f.write(f"  Tables: {', '.join(set(affected['tables']))}\n")
+                      f.write("\n")
+                  else:
+                      f.write("No objects identified for backup (ALTER/DROP statements not found)\n\n")
+                  
+                  if issues:
+                      f.write(f"CRITICAL ISSUES ({len(issues)}):\n")
+                      f.write("-" * 70 + "\n")
+                      for issue in issues:
+                          f.write(f"  [ISSUE] {issue}\n")
+                      f.write("\n")
+                  
+                  if warnings:
+                      f.write(f"WARNINGS ({len(warnings)}):\n")
+                      f.write("-" * 70 + "\n")
+                      for warning in warnings:
+                          f.write(f"  [WARNING] {warning}\n")
+                      f.write("\n")
+                  
+                  if not issues and not warnings:
+                      f.write("No security issues detected\n\n")
+                  
+                  f.write("=" * 70 + "\n")
+              
+              # Save the backup_json_data to affected_objects.json for the next stage
+              affected_path = os.path.join(report_dir, 'affected_objects.json')
+              with open(affected_path, 'w', encoding='utf-8') as f:
+                  # This is the new structure
+                  json.dump(backup_json_data, f, indent=2)
+              
+              print(f"Validation report generated: {report_path}")
+              print(f"Affected objects JSON saved: {affected_path}")
+
+          # --- MAIN EXECUTION ---
+          print(f"Validating SQL script: {script_path}\n")
+
+          syntax_ok = validate_sql_syntax(script_path)
+          issues, warnings = check_security_policies(script_path)
+          
+          # Updated function now returns two values
+          backup_data, affected_report = extract_affected_objects(script_path)
+
+          # Pass all data to the report function
+          generate_report(script_path, syntax_ok, issues, warnings, affected_report, backup_data, report_dir)
+
+          if issues:
+              print("\n" + "=" * 70)
+              print(f"CRITICAL ISSUES FOUND ({len(issues)}):")
+              print("=" * 70)
+              for issue in issues:
+                  print(f"  {issue}")
+                  print(f"##vso[task.logissue type=error]{issue}")
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]true')
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]true')
+          else:
+              print("\nNo critical security issues found")
+              print('##vso[task.setvariable variable=hasSecurityIssues;isOutput=true]false')
+          
+          if warnings:
+              print("\n" + "=" * 70)
+              print(f"WARNINGS ({len(warnings)}):\n")
+              print("=" * 70)
+              for warning in warnings:
+                  print(f"  {warning}")
+                  print(f"##vso[task.logissue type=warning]{warning}")
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]true')
+          else:
+              print('##vso[task.setvariable variable=hasWarnings;isOutput=true]false')
+
+          if not syntax_ok:
+              print("\n##vso[task.complete result=Failed;]Syntax validation failed")
+              sys.exit(1)
+
+          print("\nValidation completed successfully")
+      env:
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+        SQL_SCRIPT_PATH: $(sqlScriptPath)
+        SQL_SCRIPT_NAME_PARAM: ${{ parameters.sqlScriptName }}
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Validation Report'
+      condition: always()
+      inputs:
+        targetPath: '$(Pipeline.Workspace)/sql'
+        artifact: 'ValidationReport'
+        publishLocation: 'pipeline'
+
+- stage: Security_Review
+  displayName: 'Security Review Required'
+  dependsOn: Download_And_Validate
+  condition: |
+    and(
+      succeeded(),
+      or(
+        eq(dependencies.Download_And_Validate.outputs['ValidateScript.SQLValidation.hasSecurityIssues'], 'true'),
+        eq(dependencies.Download_And_Validate.outputs['ValidateScript.SQLValidation.hasWarnings'], 'true')
+      )
+    )
+  
+  jobs:
+  - job: WaitForApproval
+    displayName: 'Manual Security Approval'
+    pool: server
+    timeoutInMinutes: 1440
+    
+    steps:
+    
+    - task: ManualValidation@1
+      inputs:
+        notifyUsers: 'shubh.bhanushali@g7cr.com'
+        approvers: 'shubh.bhanushali@g7cr.com'
+        instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
+        onTimeout: 'reject'
+
+- stage: Backup_Database_Objects
+  displayName: 'Backup User Database Objects'
+  dependsOn: 
+    - Download_And_Validate
+    - Security_Review
+  condition: |
+    and(
+      not(failed()),
+      not(canceled()),
+      eq('${{ parameters.enableBackup }}', 'true'),
+      eq('${{ parameters.dryRun }}', 'false')
+    )
+  
+  jobs:
+  - job: CreateBackup
+    displayName: 'Backup Affected Database Objects'
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 30
+    
+    steps:
+    - checkout: none
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download Validation Results'
+      inputs:
+        artifact: 'ValidationReport'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: PythonScript@0
+      name: BackupWithSQLAlchemy
+      displayName: 'Backup Objects with SQLAlchemy'
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import os
+          import json
+          import sys
+          from datetime import datetime
+          from sqlalchemy import create_engine, text
+          from sqlalchemy.exc import SQLAlchemyError
+          from azure.identity import DefaultAzureCredential
+          from azure.keyvault.secrets import SecretClient
+          import urllib.parse
+          
+          def get_connection_string_from_keyvault():
+              """Retrieve connection string from Azure Key Vault"""
+              try:
+                  keyvault_name = $(keyVaultName)
+                  secret_name = $(secret_Name)
+                  
+                  if not keyvault_name or not secret_name:
+                      print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
+                      print(f"KEYVAULT_NAME: {keyvault_name}")
+                      print(f"SECRET_NAME: {secret_name}")
+                      return None
+                  
+                  print(f"Retrieving connection string from Key Vault: {keyvault_name}, secret: {secret_name}")
+                  
+                  credential = DefaultAzureCredential()
+                  secret_client = SecretClient(
+                      vault_url=f"https://{keyvault_name}.vault.azure.net",
+                      credential=credential
+                  )
+                  
+                  secret = secret_client.get_secret(secret_name)
+                  print("✓ Successfully retrieved connection string from Key Vault")
+                  return secret.value
+                  
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to retrieve connection string from Key Vault: {str(e)}")
+                  return None
+          
+          def validate_connection_string(conn_str):
+              """Validate and format connection string for SQLAlchemy"""
+              if not conn_str:
+                  return None
+              
+              # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
+              if conn_str.startswith('mssql+pyodbc://'):
+                  return conn_str
+              
+              # If it's a standard SQL Server connection string, convert to SQLAlchemy format
+              if 'Server=' in conn_str and 'Database=' in conn_str:
+                  try:
+                      # Parse the connection string
+                      params = {}
+                      for part in conn_str.split(';'):
+                          if '=' in part:
+                              key, value = part.split('=', 1)
+                              params[key.strip()] = value.strip()
+                      
+                      server = params.get('Server', '')
+                      database = params.get('Database', '')
+                      username = params.get('User ID', '')
+                      password = params.get('Password', '')
+                      driver = params.get('Driver', 'ODBC Driver 18 for SQL Server')
+                      
+                      # Build SQLAlchemy URL
+                      if username and password:
+                          # Using SQL authentication
+                          quoted_password = urllib.parse.quote_plus(password)
+                          sqlalchemy_url = f"mssql+pyodbc://{username}:{quoted_password}@{server}/{database}?driver={driver}"
+                      else:
+                          # Using Windows authentication or managed identity
+                          sqlalchemy_url = f"mssql+pyodbc://@{server}/{database}?driver={driver}&trusted_connection=yes"
+                      
+                      print(f"Converted connection string to SQLAlchemy format")
+                      return sqlalchemy_url
+                      
+                  except Exception as e:
+                      print(f"Warning: Failed to parse connection string: {str(e)}")
+                      # Fallback: try to use as-is with pyodbc prefix
+                      return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
+              
+              # If we can't parse it, try the odbc_connect format
+              try:
+                  return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
+              except:
+                  return None
+          
+          def test_connection(engine):
+              """Test database connection"""
+              try:
+                  with engine.connect() as conn:
+                      result = conn.execute(text("SELECT 1 as test"))
+                      row = result.fetchone()
+                      if row and row.test == 1:
+                          print("✓ Database connection test successful")
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"Connection test failed: {str(e)}")
+                  return False
+          
+          def backup_database_objects():
+              # Get connection string
+              raw_connection_string = get_connection_string_from_keyvault()
+              if not raw_connection_string:
+                  return False
+              
+              # Validate and format for SQLAlchemy
+              connection_string = validate_connection_string(raw_connection_string)
+              if not connection_string:
+                  print("##vso[task.logissue type=error]Invalid connection string format")
+                  return False
+              
+              print("Connection string formatted for SQLAlchemy")
+              
+              affected_objects_path = os.environ.get('AFFECTED_OBJECTS_PATH')
+              backup_path = os.environ.get('BACKUP_PATH')
+              
+              if not affected_objects_path or not backup_path:
+                  print("##vso[task.logissue type=error]Missing required environment variables")
+                  print(f"AFFECTED_OBJECTS_PATH: {affected_objects_path}")
+                  print(f"BACKUP_PATH: {backup_path}")
+                  return False
+              
+              # Read affected objects
+              try:
+                  with open(affected_objects_path, 'r') as f:
+                      affected_data = json.load(f)
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to read affected objects: {str(e)}")
+                  return False
+              
+              timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+              backup_file = os.path.join(backup_path, f"backup_{timestamp}.sql")
+              
+              # Create backup directory
+              os.makedirs(backup_path, exist_ok=True)
+              
+              try:
+                  # Create engine with additional parameters for Azure SQL
+                  engine = create_engine(
+                      connection_string,
+                      pool_pre_ping=True,
+                      connect_args={
+                          'connect_timeout': 30,
+                          'command_timeout': 300,
+                          'autocommit': True
+                      },
+                      echo=False  # Set to True for debugging SQL statements
+                  )
+                  
+                  # Test connection before proceeding
+                  if not test_connection(engine):
+                      print("##vso[task.logissue type=error]Database connection test failed")
+                      return False
+                  
+                  backup_script = []
+                  backup_script.append(f"-- Backup generated at {datetime.now()}")
+                  backup_script.append(f"-- Build: {os.environ.get('BUILD_BUILDNUMBER', 'Unknown')}")
+                  backup_script.append(f"-- Script: {os.environ.get('SCRIPT_NAME', 'Unknown')}")
+                  backup_script.append("")
+                  
+                  objects_backed_up = 0
+                  
+                  with engine.connect() as conn:
+                      # Backup procedures, functions, views
+                      scriptable_objects = affected_data.get('scriptableObjects', [])
+                      if scriptable_objects:
+                          print(f"Backing up {len(scriptable_objects)} scriptable object(s)...")
+                          
+                      for obj in scriptable_objects:
+                          schema = obj['schema']
+                          name = obj['name']
+                          obj_type = obj['type']
+                          action = obj['action']
+                          
+                          try:
+                              # Get object definition based on type
+                              if obj_type.upper() in ['PROCEDURE', 'FUNCTION', 'VIEW']:
+                                  # Use the appropriate system view based on object type
+                                  if obj_type.upper() == 'PROCEDURE':
+                                      object_type_query = 'P'
+                                  elif obj_type.upper() == 'FUNCTION':
+                                      object_type_query = 'FN'
+                                  elif obj_type.upper() == 'VIEW':
+                                      object_type_query = 'V'
+                                  else:
+                                      object_type_query = None
+                                  
+                                  if object_type_query:
+                                      query = text(f"""
+                                          SELECT definition 
+                                          FROM sys.sql_modules 
+                                          WHERE object_id = OBJECT_ID('[{schema}].[{name}]')
+                                      """)
+                                      
+                                      result = conn.execute(query)
+                                      row = result.fetchone()
+                                      
+                                      if row and row.definition:
+                                          backup_script.append(f"-- {obj_type}: {schema}.{name} (Action: {action})")
+                                          backup_script.append(row.definition)
+                                          backup_script.append("GO")
+                                          backup_script.append("")
+                                          objects_backed_up += 1
+                                          print(f"✓ Backed up {obj_type} {schema}.{name}")
+                                      else:
+                                          print(f"⚠ Could not find definition for {obj_type} {schema}.{name}")
+                                          
+                          except SQLAlchemyError as e:
+                              print(f"⚠ Could not backup {obj_type} {schema}.{name}: {str(e)}")
+                      
+                      # Backup table structures (for ALTER TABLE operations)
+                      table_objects = [obj for obj in affected_data.get('tableObjects', []) if obj['action'] == 'ALTER']
+                      if table_objects:
+                          print(f"Backing up {len(table_objects)} table structure(s)...")
+                          
+                      for table in table_objects:
+                          schema = table['schema']
+                          name = table['name']
+                          
+                          try:
+                              # Get table creation script using INFORMATION_SCHEMA
+                              query = text(f"""
+                                  SELECT 
+                                      c.COLUMN_NAME,
+                                      c.DATA_TYPE,
+                                      c.CHARACTER_MAXIMUM_LENGTH,
+                                      c.NUMERIC_PRECISION,
+                                      c.NUMERIC_SCALE,
+                                      c.IS_NULLABLE,
+                                      CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS CONSTRAINT_TYPE
+                                  FROM INFORMATION_SCHEMA.COLUMNS c
+                                  LEFT JOIN (
+                                      SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
+                                      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                                      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                                          ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
+                                          AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                                  ) AS pk 
+                                  ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
+                                  AND c.TABLE_NAME = pk.TABLE_NAME 
+                                  AND c.COLUMN_NAME = pk.COLUMN_NAME
+                                  WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}'
+                                  ORDER BY c.ORDINAL_POSITION
+                              """)
+                              
+                              result = conn.execute(query)
+                              columns = result.fetchall()
+                              
+                              if columns:
+                                  backup_script.append(f"-- Table structure: {schema}.{name} (Action: {table['action']})")
+                                  backup_script.append(f"CREATE TABLE [{schema}].[{name}] (")
+                                  
+                                  column_defs = []
+                                  for col in columns:
+                                      col_def = f"    [{col.COLUMN_NAME}] {col.DATA_TYPE}"
+                                      
+                                      # Handle data type specifics
+                                      if col.DATA_TYPE in ['varchar', 'nvarchar', 'char', 'nchar'] and col.CHARACTER_MAXIMUM_LENGTH:
+                                          if col.CHARACTER_MAXIMUM_LENGTH == -1:
+                                              col_def += "(MAX)"
+                                          else:
+                                              col_def += f"({col.CHARACTER_MAXIMUM_LENGTH})"
+                                      elif col.DATA_TYPE in ['decimal', 'numeric'] and col.NUMERIC_PRECISION:
+                                          if col.NUMERIC_SCALE:
+                                              col_def += f"({col.NUMERIC_PRECISION},{col.NUMERIC_SCALE})"
+                                          else:
+                                              col_def += f"({col.NUMERIC_PRECISION})"
+                                              
+                                      if col.IS_NULLABLE == 'NO':
+                                          col_def += " NOT NULL"
+                                      if col.CONSTRAINT_TYPE:
+                                          col_def += f" {col.CONSTRAINT_TYPE}"
+                                      column_defs.append(col_def)
+                                  
+                                  backup_script.append(",\n".join(column_defs))
+                                  backup_script.append(");")
+                                  backup_script.append("GO")
+                                  backup_script.append("")
+                                  objects_backed_up += 1
+                                  print(f"✓ Backed up table structure for {schema}.{name}")
+                                  
+                          except SQLAlchemyError as e:
+                              print(f"⚠ Could not backup table structure for {schema}.{name}: {str(e)}")
+                  
+                  # Write backup script to file
+                  if len(backup_script) > 6:  # More than just headers
+                      with open(backup_file, 'w', encoding='utf-8') as f:
+                          f.write('\n'.join(backup_script))
+                      
+                      file_size = os.path.getsize(backup_file)
+                      print(f"✓ Backup completed: {backup_file} ({file_size} bytes)")
+                      print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
+                      print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
+                      print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]{objects_backed_up}")
+                      
+                      return True
+                  else:
+                      print("No objects required backup or no definitions found")
+                      # Create a minimal backup file for audit purposes
+                      with open(backup_file, 'w', encoding='utf-8') as f:
+                          f.write('\n'.join(backup_script))
+                          f.write("\n-- No object definitions were found to backup\n")
+                      
+                      print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
+                      print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
+                      print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]0")
+                      return True
+                      
+              except SQLAlchemyError as e:
+                  print(f"##vso[task.logissue type=error]Backup failed: {str(e)}")
+                  return False
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Unexpected error during backup: {str(e)}")
+                  return False
+          
+          if __name__ == "__main__":
+              success = backup_database_objects()
+              sys.exit(0 if success else 1)
+      env:
+        #KEYVAULT_NAME: $(keyVaultName)
+        #SECRET_NAME: $(secretName)
+        AFFECTED_OBJECTS_PATH: $(Pipeline.Workspace)/sql/affected_objects.json
+        BACKUP_PATH: $(backupPath)
+        SCRIPT_NAME: ${{ parameters.sqlScriptName }}
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Backup Files'
+      condition: always()
+      inputs:
+        targetPath: '$(backupPath)'
+        artifact: 'DatabaseBackup'
+        publishLocation: 'pipeline'
+
+- stage: Execute_SQL_Script
+  displayName: 'Execute SQL Script'
+
+  dependsOn: 
+    - Download_And_Validate
+    - Security_Review
+    - Backup_Database_Objects
+  condition: |
+    and(
+      not(failed()),
+      not(canceled()),
+      eq('${{ parameters.dryRun }}', 'false')
+    )
+  
+  jobs:
+  - job: ExecuteScript
+    displayName: 'Run SQL Script'
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 60
+    
+    steps:
+    - checkout: none
+    
+    - task: DownloadPipelineArtifact@2
+      displayName: 'Download SQL Script'
+      inputs:
+        artifact: 'SQLScript'
+        path: '$(Pipeline.Workspace)/sql'
+
+    - task: PythonScript@0
+      name: ExecuteSQLWithSQLAlchemy
+      displayName: 'Execute SQL Script with SQLAlchemy'
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import os
+          import sys
+          import time
+          from datetime import datetime
+          from sqlalchemy import create_engine, text
+          from sqlalchemy.exc import SQLAlchemyError
+          from azure.identity import DefaultAzureCredential
+          from azure.keyvault.secrets import SecretClient
+          
+          def get_connection_string_from_keyvault():
+              """Retrieve connection string from Azure Key Vault"""
+              try:
+                  keyvault_name = os.environ.get('KEYVAULT_NAME')
+                  secret_name = os.environ.get('SECRET_NAME')
+                  
+                  if not keyvault_name or not secret_name:
+                      print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
+                      print(f"KEYVAULT_NAME: {keyvault_name}")
+                      print(f"SECRET_NAME: {secret_name}")
+                      return None
+                  
+                  credential = DefaultAzureCredential()
+                  secret_client = SecretClient(
+                      vault_url=f"https://{keyvault_name}.vault.azure.net",
+                      credential=credential
+                  )
+                  
+                  secret = secret_client.get_secret(secret_name)
+                  return secret.value
+                  
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to retrieve connection string from Key Vault: {str(e)}")
+                  return None
+          
+          def log_message(message, log_type="INFO", log_file=None):
+              timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+              log_entry = f"[{timestamp}] [{log_type}] {message}"
+              
+              if log_file:
+                  with open(log_file, 'a', encoding='utf-8') as f:
+                      f.write(log_entry + '\n')
+              
+              print(log_entry)
+              
+              # Send to Azure DevOps logs
+              if log_type == "ERROR":
+                  print(f"##vso[task.logissue type=error]{message}")
+              elif log_type == "WARNING":
+                  print(f"##vso[task.logissue type=warning]{message}")
+          
+          def split_sql_batches(sql_content):
+              """Split SQL script into batches using GO statements"""
+              batches = []
+              current_batch = []
+              
+              for line in sql_content.split('\n'):
+                  line_stripped = line.strip()
+                  if line_stripped.upper() == 'GO':
+                      if current_batch:
+                          batches.append('\n'.join(current_batch))
+                          current_batch = []
+                  else:
+                      current_batch.append(line)
+              
+              # Add the last batch if exists
+              if current_batch:
+                  batches.append('\n'.join(current_batch))
+              
+              return batches
+          
+          def execute_sql_script():
+              # Get connection string
+              connection_string = get_connection_string_from_keyvault()
+              if not connection_string:
+                  return False
+              
+              script_path = os.environ.get('SQL_SCRIPT_PATH')
+              
+              if not script_path or not os.path.exists(script_path):
+                  log_message(f"SQL script not found at {script_path}", "ERROR")
+                  return False
+              
+              # Create logs directory
+              logs_path = os.environ.get('LOGS_PATH', './logs')
+              os.makedirs(logs_path, exist_ok=True)
+              log_file = os.path.join(logs_path, f"execution_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
+              
+              try:
+                  log_message("Starting SQL script execution with SQLAlchemy", log_file=log_file)
+                  
+                  # Create engine with connection pooling and timeout settings
+                  engine = create_engine(
+                      connection_string,
+                      pool_pre_ping=True,
+                      connect_args={
+                          'connect_timeout': 30,
+                          'command_timeout': 600  # 10 minutes per command
+                      }
+                  )
+                  
+                  # Read SQL script
+                  with open(script_path, 'r', encoding='utf-8') as f:
+                      sql_content = f.read()
+                  
+                  if not sql_content.strip():
+                      log_message("SQL script is empty", "ERROR", log_file)
+                      return False
+                  
+                  # Split into batches
+                  batches = split_sql_batches(sql_content)
+                  log_message(f"Found {len(batches)} batch(es) to execute", log_file=log_file)
+                  
+                  executed_count = 0
+                  total_duration = 0
+                  
+                  with engine.connect() as connection:
+                      for i, batch in enumerate(batches):
+                          batch = batch.strip()
+                          if not batch:
+                              continue
+                          
+                          batch_number = i + 1
+                          batch_preview = batch[:150] + "..." if len(batch) > 150 else batch
+                          
+                          log_message(f"Executing batch {batch_number}/{len(batches)}", log_file=log_file)
+                          log_message(f"Preview: {batch_preview}", log_file=log_file)
+                          
+                          try:
+                              start_time = time.time()
+                              
+                              # Use text() to handle parameterized queries if needed
+                              sql_text = text(batch)
+                              
+                              # Execute the batch
+                              result = connection.execute(sql_text)
+                              
+                              # If it's a SELECT statement, you can process results
+                              if result.returns_rows:
+                                  rows = result.fetchall()
+                                  log_message(f"Query returned {len(rows)} row(s)", log_file=log_file)
+                              
+                              duration = time.time() - start_time
+                              total_duration += duration
+                              executed_count += 1
+                              
+                              log_message(f"Batch {batch_number} completed in {duration:.2f}s", log_file=log_file)
+                              
+                              # Commit after each successful batch
+                              connection.commit()
+                              
+                          except SQLAlchemyError as e:
+                              log_message(f"Batch {batch_number} failed: {str(e)}", "ERROR", log_file)
+                              log_message(f"Failed batch content: {batch}", "ERROR", log_file)
+                              
+                              # Rollback the transaction
+                              connection.rollback()
+                              raise
+                  
+                  log_message(f"SQL script executed successfully", "SUCCESS", log_file)
+                  log_message(f"Total batches executed: {executed_count}", log_file=log_file)
+                  log_message(f"Total duration: {total_duration:.2f}s", log_file=log_file)
+                  
+                  # Set output variables
+                  print(f"##vso[task.setvariable variable=executionResult;isOutput=true]Success")
+                  print(f"##vso[task.setvariable variable=executedCount;isOutput=true]{executed_count}")
+                  print(f"##vso[task.setvariable variable=totalDuration;isOutput=true]{total_duration:.2f}")
+                  
+                  return True
+                  
+              except SQLAlchemyError as e:
+                  log_message(f"SQL execution failed: {str(e)}", "ERROR", log_file)
+                  print(f"##vso[task.setvariable variable=executionResult;isOutput=true]Failed")
+                  return False
+              except Exception as e:
+                  log_message(f"Unexpected error: {str(e)}", "ERROR", log_file)
+                  print(f"##vso[task.setvariable variable=executionResult;isOutput=true]Failed")
+                  return False
+          
+          if __name__ == "__main__":
+              success = execute_sql_script()
+              sys.exit(0 if success else 1)
+      env:
+        KEYVAULT_NAME: $(keyVaultName)
+        SECRET_NAME: $(secretName)
+        SQL_SCRIPT_PATH: $(sqlScriptPath)
+        LOGS_PATH: $(logsPath)
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Execution Logs'
+      condition: always()
+      inputs:
+        targetPath: '$(logsPath)'
+        artifact: 'ExecutionLogs'
+        publishLocation: 'pipeline'
+
+- stage: Notify_And_Audit
+  displayName: 'Notification and Audit'
+  dependsOn: 
+    - Download_And_Validate
+    - Backup_Database_Objects
+    - Execute_SQL_Script
+  condition: always()
+  
+  jobs:
+  - job: SendNotification
+    displayName: 'Send Execution Results'
+    pool:
+      name: ${{ parameters.agentPool }}
+    timeoutInMinutes: 10
+    
+    steps:
+    - checkout: none
+    
+    - task: PowerShell@2
+      displayName: 'Generate Execution Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $result = "$(ExecuteSQLWithSQLAlchemy.executionResult)"
+          $buildNumber = "$(Build.BuildNumber)"
+          $scriptName = "${{ parameters.sqlScriptName }}"
+          $isDryRun = "${{ parameters.dryRun }}"
+          $executedCount = "$(ExecuteSQLWithSQLAlchemy.executedCount)"
+          $totalDuration = "$(ExecuteSQLWithSQLAlchemy.totalDuration)"
+          $objectsBackedUp = "$(BackupWithSQLAlchemy.objectsBackedUp)"
+          
+          Write-Host ""
+          Write-Host "=" * 70
+          Write-Host "PIPELINE EXECUTION SUMMARY"
+          Write-Host "=" * 70
+          Write-Host "Build Number: $buildNumber"
+          Write-Host "Script Name: $scriptName"
+          Write-Host "Dry Run Mode: $isDryRun"
+          Write-Host "Executed By: $(Build.RequestedFor)"
+          Write-Host "Batches Executed: $executedCount"
+          Write-Host "Total Duration: $totalDuration seconds"
+          Write-Host "Objects Backed Up: $objectsBackedUp"
+          
+          if ($isDryRun -eq "true") {
+              Write-Host ""
+              Write-Host "DRY RUN COMPLETED - VALIDATION ONLY" -ForegroundColor Cyan
+          }
+          elseif ($result -eq "Success") {
+              Write-Host ""
+              Write-Host "EXECUTION SUCCESSFUL" -ForegroundColor Green
+          } else {
+              Write-Host ""
+              Write-Host "EXECUTION FAILED" -ForegroundColor Red
+          }
+          
+          Write-Host "=" * 70
+
+    - task: PythonScript@0
+      displayName: 'Create Audit Trail with Python'
+      condition: eq('${{ parameters.dryRun }}', 'false')
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import os
+          import json
+          from datetime import datetime
+          from azure.identity import DefaultAzureCredential
+          from azure.storage.blob import BlobServiceClient
+          
+          def create_audit_trail():
+              audit_data = {
+                  'buildNumber': os.environ.get('BUILD_BUILDNUMBER', 'Unknown'),
+                  'buildId': os.environ.get('BUILD_BUILDID', 'Unknown'),
+                  'scriptName': os.environ.get('SCRIPT_NAME', 'Unknown'),
+                  'executionResult': os.environ.get('EXECUTION_RESULT', 'Unknown'),
+                  'executedBy': os.environ.get('BUILD_REQUESTEDFOR', 'Unknown'),
+                  'executedAt': datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                  'dryRun': os.environ.get('DRY_RUN', 'false'),
+                  'executedCount': os.environ.get('EXECUTED_COUNT', '0'),
+                  'totalDuration': os.environ.get('TOTAL_DURATION', '0'),
+                  'objectsBackedUp': os.environ.get('OBJECTS_BACKED_UP', '0')
+              }
+              
+              # Save audit log locally
+              audit_filename = f"audit_{audit_data['buildNumber']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+              with open(audit_filename, 'w') as f:
+                  json.dump(audit_data, f, indent=2)
+              
+              print(f"Audit log created: {audit_filename}")
+              
+              # Upload to blob storage
+              try:
+                  storage_account_name = os.environ.get('STORAGE_ACCOUNT_NAME')
+                  if storage_account_name:
+                      credential = DefaultAzureCredential()
+                      blob_service_client = BlobServiceClient(
+                          account_url=f"https://{storage_account_name}.blob.core.windows.net",
+                          credential=credential
+                      )
+                      
+                      container_client = blob_service_client.get_container_client("audit-logs")
+                      if not container_client.exists():
+                          container_client.create_container()
+                      
+                      with open(audit_filename, "rb") as data:
+                          container_client.upload_blob(name=audit_filename, data=data, overwrite=True)
+                      
+                      print("Audit log uploaded to blob storage")
+                  else:
+                      print("Storage account name not configured, skipping blob upload")
+                      
+              except Exception as e:
+                  print(f"Warning: Failed to upload audit log to blob storage: {str(e)}")
+          
+          if __name__ == "__main__":
+              create_audit_trail()
+      env:
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
+        BUILD_BUILDID: $(Build.BuildId)
+        BUILD_REQUESTEDFOR: $(Build.RequestedFor)
+        SCRIPT_NAME: ${{ parameters.sqlScriptName }}
+        EXECUTION_RESULT: $(ExecuteSQLWithSQLAlchemy.executionResult)
+        EXECUTED_COUNT: $(ExecuteSQLWithSQLAlchemy.executedCount)
+        TOTAL_DURATION: $(ExecuteSQLWithSQLAlchemy.totalDuration)
+        OBJECTS_BACKED_UP: $(BackupWithSQLAlchemy.objectsBackedUp)
+        DRY_RUN: ${{ parameters.dryRun }}
+        STORAGE_ACCOUNT_NAME: $(storageAccountName)
