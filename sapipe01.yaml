@@ -724,7 +724,7 @@ stages:
                       database = params.get('Database', '')
                       username = params.get('User ID', '')
                       password = params.get('Password', '')
-                      driver = params.get('Driver', 'ODBC Driver 17 for SQL Server')
+                      driver = params.get('Driver', 'ODBC Driver 18 for SQL Server')
                       
                       # Build SQLAlchemy URL
                       if username and password:
@@ -986,6 +986,7 @@ stages:
         AFFECTED_OBJECTS_PATH: $(Pipeline.Workspace)/sql/affected_objects.json
         BACKUP_PATH: $(backupPath)
         SCRIPT_NAME: ${{ parameters.sqlScriptName }}
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
 
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Backup Files'
@@ -1214,6 +1215,7 @@ stages:
         SECRET_NAME: $(secretName)
         SQL_SCRIPT_PATH: $(sqlScriptPath)
         LOGS_PATH: $(logsPath)
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
 
     - task: PublishPipelineArtifact@1
       displayName: 'Publish Execution Logs'
