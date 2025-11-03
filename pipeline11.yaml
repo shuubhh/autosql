@@ -961,7 +961,7 @@ stages:
               $lines = $scriptContent -split "`r`n|`n|`r"
               foreach ($line in $lines) {
                   $trimmedLine = $line.Trim()
-                  if ($trimmedLine -match '^(?i:GO)) {
+                  if ($trimmedLine -match '^(?i)GO$') {
                       $batchContent = $currentBatch.ToString().Trim()
                       if ($batchContent) { $batches += $batchContent }
                       $currentBatch = [System.Text.StringBuilder]::new()
