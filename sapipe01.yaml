@@ -683,6 +683,8 @@ stages:
                   
                   if not keyvault_name or not secret_name:
                       print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
+                      print(f"KEYVAULT_NAME: {keyvault_name}")
+                      print(f"SECRET_NAME: {secret_name}")
                       return None
                   
                   print(f"Retrieving connection string from Key Vault: {keyvault_name}, secret: {secret_name}")
@@ -782,6 +784,8 @@ stages:
               
               if not affected_objects_path or not backup_path:
                   print("##vso[task.logissue type=error]Missing required environment variables")
+                  print(f"AFFECTED_OBJECTS_PATH: {affected_objects_path}")
+                  print(f"BACKUP_PATH: {backup_path}")
                   return False
               
               # Read affected objects
@@ -1048,6 +1052,8 @@ stages:
                   
                   if not keyvault_name or not secret_name:
                       print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
+                      print(f"KEYVAULT_NAME: {keyvault_name}")
+                      print(f"SECRET_NAME: {secret_name}")
                       return None
                   
                   credential = DefaultAzureCredential()
