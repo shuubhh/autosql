@@ -677,8 +677,8 @@ stages:
           def get_connection_string_from_keyvault():
               """Retrieve connection string from Azure Key Vault"""
               try:
-                  keyvault_name = os.environ.get('KEYVAULT_NAME')
-                  secret_name = os.environ.get('SECRET_NAME')
+                  keyvault_name = os.environ.get('keyVaultName')
+                  secret_name = os.environ.get('secretName')
                   
                   if not keyvault_name or not secret_name:
                       print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
