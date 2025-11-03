@@ -33,11 +33,6 @@ variables:
 stages:
 - stage: Download_And_Validate
   displayName: 'Download and Validate SQL Script'
-  #variables:
-   # - name: keyVaultName
-    #  value: 'sql-validator-kv'
-    #- name: secretName
-     # value: 'sql-conn-string'
   jobs:
   - job: DownloadScript
     displayName: 'Download SQL Script from Blob Storage'
