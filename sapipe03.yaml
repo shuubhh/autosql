@@ -704,75 +704,75 @@ stages:
                   return None
           
           
-            def validate_connection_string(conn_str):
-                """Validate and format connection string for SQLAlchemy"""
-                if not conn_str:
-                    return None
+          def validate_connection_string(conn_str):
+              """Validate and format connection string for SQLAlchemy"""
+              if not conn_str:
+                  return None
 
-                # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
-                if conn_str.startswith('mssql+pyodbc://'):
-                    return conn_str
+              # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
+              if conn_str.startswith('mssql+pyodbc://'):
+                  return conn_str
 
-                # If it's a standard SQL Server connection string, convert to SQLAlchemy format
-                if 'Server=' in conn_str and 'Database=' in conn_str:
-                    try:
-                        # Parse the connection string
-                        params = {}
-                        for part in conn_str.split(';'):
-                            if '=' in part:
-                                key, value = part.split('=', 1)
-                                params[key.strip()] = value.strip()
+              # If it's a standard SQL Server connection string, convert to SQLAlchemy format
+              if 'Server=' in conn_str and 'Database=' in conn_str:
+                  try:
+                      # Parse the connection string
+                      params = {}
+                      for part in conn_str.split(';'):
+                          if '=' in part:
+                              key, value = part.split('=', 1)
+                              params[key.strip()] = value.strip()
 
-                        server = params.get('Server', '')
-                        database = params.get('Database', '')
-                        username = params.get('User ID', '')
-                        password = params.get('Password', '')
-                        driver = params.get('Driver', 'ODBC Driver 18 for SQL Server')
+                      server = params.get('Server', '')
+                      database = params.get('Database', '')
+                      username = params.get('User ID', '')
+                      password = params.get('Password', '')
+                      driver = params.get('Driver', 'ODBC Driver 18 for SQL Server')
 
-                        # Build SQLAlchemy URL
-                        if username and password:
-                            # Using SQL authentication
-                            quoted_password = urllib.parse.quote_plus(password)
-                            sqlalchemy_url = (
-                                f"mssql+pyodbc://{username}:{quoted_password}@{server}/{database}"
-                                f"?driver={urllib.parse.quote_plus(driver)}"
-                            )
-                        else:
-                            # Using Windows authentication or managed identity
-                            sqlalchemy_url = (
-                                f"mssql+pyodbc://@{server}/{database}"
-                                f"?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
-                            )
+                      # Build SQLAlchemy URL
+                      if username and password:
+                          # Using SQL authentication
+                          quoted_password = urllib.parse.quote_plus(password)
+                          sqlalchemy_url = (
+                              f"mssql+pyodbc://{username}:{quoted_password}@{server}/{database}"
+                              f"?driver={urllib.parse.quote_plus(driver)}"
+                          )
+                      else:
+                          # Using Windows authentication or managed identity
+                          sqlalchemy_url = (
+                              f"mssql+pyodbc://@{server}/{database}"
+                              f"?driver={urllib.parse.quote_plus(driver)}&trusted_connection=yes"
+                          )
 
-                        print("Successfully converted connection string to SQLAlchemy format")
-                        return sqlalchemy_url
+                      print("Successfully converted connection string to SQLAlchemy format")
+                      return sqlalchemy_url
 
-                    except Exception as e:
-                        print(f"Warning: Failed to parse connection string: {str(e)}")
-                        # Fallback: try to use as-is with pyodbc prefix
-                        return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
+                  except Exception as e:
+                      print(f"Warning: Failed to parse connection string: {str(e)}")
+                      # Fallback: try to use as-is with pyodbc prefix
+                      return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
 
-                # If we can't parse it, try the odbc_connect format
-                try:
-                    return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
-                except Exception as e:
-                    print(f"Error encoding fallback connection string: {str(e)}")
-                    return None
+              # If we can't parse it, try the odbc_connect format
+              try:
+                  return f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
+              except Exception as e:
+                  print(f"Error encoding fallback connection string: {str(e)}")
+                  return None
 
 
-            def test_connection(engine):
-                """Test database connection"""
-                try:
-                    with engine.connect() as conn:
-                        result = conn.execute(text("SELECT 1 as test"))
-                        row = result.fetchone()
-                        if row and row.test == 1:
-                            print("[OK] Database connection test successful")
-                            return True
-                    return False
-                except Exception as e:
-                    print(f"Connection test failed: {str(e)}")
-                    return False
+          def test_connection(engine):
+              """Test database connection"""
+              try:
+                  with engine.connect() as conn:
+                      result = conn.execute(text("SELECT 1 as test"))
+                      row = result.fetchone()
+                      if row and row.test == 1:
+                          print("[OK] Database connection test successful")
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"Connection test failed: {str(e)}")
+                  return False
 
           
           def backup_database_objects():
