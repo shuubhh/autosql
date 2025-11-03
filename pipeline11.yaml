@@ -631,9 +631,12 @@ stages:
     timeoutInMinutes: 1440
     
     steps:
-    - task: ManualValidation@0
+    
+    - task: ManualValidation@1
       inputs:
-        instructions: 'Security issues or warnings were found in the SQL script. Please review the validation report and approve or reject the execution.'
+        notifyUsers: 'shubh.bhanushali@g7cr.com'
+        approvers: 'shubh.bhanushali@g7cr.com'
+        instructions: 'Issues found with the sql script. please check the validation file and approve/reject'
         onTimeout: 'reject'
 
 - stage: Backup_Database_Objects
@@ -643,7 +646,8 @@ stages:
     - Security_Review
   condition: |
     and(
-      succeeded(),
+      not(failed()),
+      not(canceled()),
       eq('${{ parameters.enableBackup }}', 'true'),
       eq('${{ parameters.dryRun }}', 'false')
     )
@@ -676,8 +680,7 @@ stages:
           
           function Escape-SqlName {
               param([string]$name)
-              # Simple escape for regex: escape . and \
-              return $name.Replace('\', '\\').Replace('.', '\.')
+              return [regex]::Escape($name).Replace('\\[', '[').Replace('\\]', ']').Replace('\\.', '.')
           }
           
           try {
@@ -779,23 +782,17 @@ stages:
                                   } catch {
                                   }
 
-                                  # === SAFER BACKUP LOGIC ===
-                                  # 1. Replace ALTER with CREATE, case-insensitively, on the first match
-                                  $liveBackupQuery = [regex]::Replace($definition, "^\s*ALTER\s+", "CREATE ", "IgnoreCase, Multiline", 1)
-
-                                  # 2. Replace the original object name with the new backup name
-                                  $originalNamePattern = "(\[?$(Escape-SqlName $obj.schema)\]?\.)?\[?$(Escape-SqlName $obj.name)\]?"
-                                  $match = [regex]::Match($liveBackupQuery, $originalNamePattern, "IgnoreCase")
+                                  $lines = $definition -split "`r`n"
                                   
-                                  if ($match.Success) {
-                                      # Find the *first* match and replace it
-                                      $liveBackupQuery = [regex]::Replace($liveBackupQuery, $originalNamePattern, $backupFullName, "IgnoreCase", 1)
-                                  } else {
-                                      Write-Warning "  Could not find original object name in definition to replace for backup object."
+                                  for ($i = 0; $i -lt $lines.Count; $i++) {
+                                      if ($lines[$i] -match "^\s*(CREATE|ALTER)\s+${objectType}\s+") {
+                                          $lines[$i] = $lines[$i] -replace "(?i)(CREATE|ALTER)(\s+${objectType}\s+).*", "CREATE`$2$backupFullName"
+                                          break
+                                      }
                                   }
                                   
-                                  # 3. Remove 'GO' statements correctly (only 'GO' on its own line)
-                                  $liveBackupQuery = $liveBackupQuery -replace '(?im)^\s*GO\s*$', ''
+                                  $liveBackupQuery = $lines -join "`r`n"
+                                  $liveBackupQuery = $liveBackupQuery -replace '(?i)\bGO\b', ''
                                   
                                   Invoke-Sqlcmd -ConnectionString $connectionString -Query $liveBackupQuery -QueryTimeout 300 -ErrorAction Stop
                                   Write-Host "    ✓ Live backup object created: $backupFullName"
@@ -899,7 +896,8 @@ stages:
     - Backup_Database_Objects
   condition: |
     and(
-      succeeded(),
+      not(failed()),
+      not(canceled()),
       eq('${{ parameters.dryRun }}', 'false')
     )
   
@@ -930,23 +928,14 @@ stages:
           $ErrorActionPreference = "Stop"
           
           try {
-              # Clear SQL connection pools
-              Write-Host "Clearing all SQL connection pools..."
-              [System.Data.SqlClient.SqlConnection]::ClearAllPools()
-              Write-Host "✓ Connection pools cleared."
-              
               Write-Host "Retrieving connection string..."
               $connectionString = Get-AzKeyVaultSecret -VaultName "$(keyVaultName)" -Name "$(secretName)" -AsPlainText
               
-              $scriptFile = '$(sqlScriptPath)'
-              Write-Host "Verifying SQL script at $scriptFile"
-
-              if (-not (Test-Path $scriptFile)) {
-                  throw "SQL script not found at $scriptFile"
-              }
+              Write-Host "Reading SQL script..."
+              $scriptContent = Get-Content -Path '$(sqlScriptPath)' -Raw -Encoding UTF8
+              $scriptContent = $scriptContent -replace '^\xEF\xBB\xBF', ''
               
-              $scriptContentCheck = Get-Content -Path $scriptFile -Raw
-              if ([string]::IsNullOrEmpty($scriptContentCheck.Trim())) {
+              if ([string]::IsNullOrEmpty($scriptContent)) {
                   throw "SQL script is empty"
               }
               
@@ -964,53 +953,90 @@ stages:
               
               $logHeader | Out-File -FilePath $logFile -Encoding UTF8
               
-              Write-Host "Executing SQL script: $scriptFile"
-              Write-Host "Using Invoke-Sqlcmd -InputFile to correctly handle GO batch separators."
-
-              $startTime = Get-Date
+              Write-Host "Processing SQL script batches..."
               
-              # Use -InputFile parameter, which correctly parses 'GO' separators
-              Invoke-Sqlcmd `
-                  -ConnectionString $connectionString `
-                  -InputFile $scriptFile `
-                  -QueryTimeout 600 `
-                  -ErrorAction Stop `
-                  -OutputSqlErrors $true `
-                  | Out-File -FilePath $logFile -Append
+              $batches = @()
+              $currentBatch = [System.Text.StringBuilder]::new()
               
-              $duration = (Get-Date) - $startTime
-              $totalDuration = $duration.TotalSeconds
+              $lines = $scriptContent -split "`r`n|`n|`r"
+              foreach ($line in $lines) {
+                  $trimmedLine = $line.Trim()
+                  if ($trimmedLine -match '^(?i:GO)) {
+                      $batchContent = $currentBatch.ToString().Trim()
+                      if ($batchContent) { $batches += $batchContent }
+                      $currentBatch = [System.Text.StringBuilder]::new()
+                  } else {
+                      if ($currentBatch.Length -gt 0) { $currentBatch.AppendLine() | Out-Null }
+                      $currentBatch.Append($line) | Out-Null
+                  }
+              }
+              $finalBatch = $currentBatch.ToString().Trim()
+              if ($finalBatch) { $batches += $finalBatch }
+              
+              if ($batches.Count -eq 0) {
+                  Write-Host "No GO statements found, treating entire script as one batch"
+                  $batches = @($scriptContent.Trim())
+              }
+              
+              Write-Host "Found $($batches.Count) batch(es) to execute"
+              
+              $executedCount = 0
+              $totalDuration = [TimeSpan]::Zero
+              
+              for ($i = 0; $i -lt $batches.Count; $i++) {
+                  $batch = $batches[$i].Trim()
+                  if (-not $batch) { continue }
+                  
+                  $batchNumber = $i + 1
+                  $preview = if ($batch.Length -gt 150) { $batch.Substring(0, 150) + "..." } else { $batch }
+                  
+                  Write-Host ""
+                  Write-Host "Executing batch $batchNumber of $($batches.Count)"
+                  Write-Host "Preview: $preview"
+                  
+                  try {
+                      $startTime = Get-Date
+                      
+                      $cleanBatch = $batch.TrimStart([char]0xFEFF, [char]0xFFFE, [char]0x200B).Trim()
+                      
+                      Invoke-Sqlcmd -ConnectionString $connectionString -Query $cleanBatch -QueryTimeout 600 -ErrorAction Stop
+                      
+                      $duration = (Get-Date) - $startTime
+                      $totalDuration += $duration
+                      $executedCount++
+                      
+                      $successMsg = "Batch $batchNumber completed in $([math]::Round($duration.TotalSeconds, 2))s"
+                      Write-Host $successMsg -ForegroundColor Green
+                      "$successMsg`n" | Out-File -FilePath $logFile -Append
+                  }
+                  catch {
+                      $errorMsg = "Batch $batchNumber failed: $($_.Exception.Message)"
+                      Write-Host $errorMsg -ForegroundColor Red
+                      "$errorMsg`n" | Out-File -FilePath $logFile -Append
+                      
+                      Write-Host "Full batch content:" -ForegroundColor Yellow
+                      Write-Host $batch -ForegroundColor Yellow
+                      
+                      throw "SQL execution failed at batch $batchNumber"
+                  }
+              }
               
               Write-Host ""
               Write-Host "SQL SCRIPT EXECUTED SUCCESSFULLY" -ForegroundColor Green
-              Write-Host "Total duration: $([math]::Round($totalDuration, 2))s" -ForegroundColor Green
-              
-              "`r`n========================================" | Out-File -FilePath $logFile -Append
-              "Execution completed in $([math]::Round($totalDuration, 2))s" | Out-File -FilePath $logFile -Append
+              Write-Host "Batches executed: $executedCount" -ForegroundColor Green
+              Write-Host "Total duration: $([math]::Round($totalDuration.TotalSeconds, 2))s" -ForegroundColor Green
               
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Success"
-              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]1"
-              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration, 2))"
+              Write-Host "##vso[task.setvariable variable=executedCount;isOutput=true]$executedCount"
+              Write-Host "##vso[task.setvariable variable=totalDuration;isOutput=true]$([math]::Round($totalDuration.TotalSeconds, 2))"
           }
           catch {
               Write-Host ""
               Write-Host "SQL SCRIPT EXECUTION FAILED" -ForegroundColor Red
-              
-              # Get the full error message
-              $errorMessage = $_.Exception.Message
-              if ($_.Exception.InnerException) {
-                  $errorMessage += "`nInner Exception: $($_.Exception.InnerException.Message)"
-              }
-              
-              Write-Host "Error: $errorMessage" -ForegroundColor Red
-              
-              if (Test-Path $logFile) {
-                  "`r`n========================================" | Out-File -FilePath $logFile -Append
-                  "EXECUTION FAILED: $errorMessage" | Out-File -FilePath $logFile -Append
-              }
+              Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
               
               Write-Host "##vso[task.setvariable variable=executionResult;isOutput=true]Failed"
-              Write-Host "##vso[task.logissue type=error]SQL execution failed: $errorMessage"
+              Write-Host "##vso[task.logissue type=error]SQL execution failed"
               
               exit 1
           }
