@@ -678,8 +678,8 @@ stages:
           def get_connection_string_from_keyvault():
               """Retrieve connection string from Azure Key Vault"""
               try:
-                  keyvault_name = $(keyVaultName)
-                  secret_name = $(secret_Name)
+                  keyvault_name = [$(keyVaultName)]
+                  secret_name = [$(secret_Name)]
                   
                   if not keyvault_name or not secret_name:
                       print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
