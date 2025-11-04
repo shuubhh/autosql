@@ -995,13 +995,13 @@ stages:
         SCRIPT_NAME: ${{ parameters.sqlScriptName }}
         BUILD_BUILDNUMBER: $(Build.BuildNumber)
 
-- task: PublishPipelineArtifact@1
-  displayName: 'Publish Backup Files'
-  condition: always()
-  inputs:
-    targetPath: '$(backupPath)'
-    artifact: 'DatabaseBackup'
-    publishLocation: 'pipeline'
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Backup Files'
+      condition: always()
+      inputs:
+        targetPath: '$(backupPath)'
+        artifact: 'DatabaseBackup'
+        publishLocation: 'pipeline'
 
 - stage: Execute_SQL_Script
   displayName: 'Execute SQL Script'
