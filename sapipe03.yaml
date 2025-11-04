@@ -1306,21 +1306,30 @@ stages:
                               if is_ddl_statement(batch):
                                   # Clean the batch to remove comments
                                   cleaned_batch = clean_batch_for_ddl(batch)
-                                  log_message(f"Executing DDL statement using sp_executesql", log_file=log_file)
+                                  log_message(f"Executing DDL statement using EXEC()", log_file=log_file)
                                   
-                                  # Escape single quotes in the SQL statement
+                                  # DEBUG: Log the cleaned batch
+                                  log_message(f"Cleaned batch (first 200 chars): {cleaned_batch[:200]}", log_file=log_file)
+                                  
+                                  # Escape single quotes in the SQL statement for EXEC()
                                   escaped_sql = cleaned_batch.replace("'", "''")
                                   
-                                  # Use sp_executesql which properly handles DDL statements
-                                  exec_sql = f"EXEC sp_executesql N'{escaped_sql}'"
+                                  # Use EXEC() which can execute DDL statements
+                                  exec_sql = f"EXEC('{escaped_sql}')"
                                   
-                                  # Use raw connection with autocommit
+                                  # DEBUG: Log the final SQL being executed (first 300 chars)
+                                  log_message(f"Final EXEC SQL (first 300 chars): {exec_sql[:300]}", log_file=log_file)
+                                  
+                                  # Get raw connection and create a new cursor with autocommit
                                   raw_connection = connection.connection
+                                  original_autocommit = raw_connection.autocommit
                                   raw_connection.autocommit = True
+                                  
                                   cursor = raw_connection.cursor()
                                   cursor.execute(exec_sql)
                                   cursor.close()
-                                  raw_connection.autocommit = False
+                                  
+                                  raw_connection.autocommit = original_autocommit
                               else:
                                   # Use text() for regular DML statements
                                   sql_text = text(batch)
