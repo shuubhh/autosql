@@ -660,340 +660,340 @@ stages:
         path: '$(Pipeline.Workspace)/sql'
 
     - task: PythonScript@0
-    displayName: 'Backup Objects with SQLAlchemy'
-    inputs:
-      scriptSource: 'inline'
-      script: |
-        import os
-        import json
-        import sys
-        from datetime import datetime
-        from sqlalchemy import create_engine, text
-        from sqlalchemy.exc import SQLAlchemyError
-        from azure.identity import DefaultAzureCredential
-        from azure.keyvault.secrets import SecretClient
-        import urllib.parse
-        
-        def get_connection_string_from_keyvault():
-            """Retrieve connection string from Azure Key Vault"""
-            try:
-                keyvault_name = os.getenv("keyVaultName")
-                secret_name = os.getenv("secretName")
-                
-                if not keyvault_name or not secret_name:
-                    print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
-                    print(f"KEYVAULT_NAME: {keyvault_name}")
-                    print(f"SECRET_NAME: {secret_name}")
-                    return None
-                
-                print(f"Retrieving connection string from Key Vault: {keyvault_name}, secret: {secret_name}")
-                
-                credential = DefaultAzureCredential()
-                secret_client = SecretClient(
-                    vault_url=f"https://{keyvault_name}.vault.azure.net",
-                    credential=credential
-                )
-                
-                secret = secret_client.get_secret(secret_name)
-                print(" Successfully retrieved connection string from Key Vault")
-                print(repr(secret.value))
-                return secret.value
-                
-            except Exception as e:
-                print(f"##vso[task.logissue type=error]Failed to retrieve connection string from Key Vault: {str(e)}")
-                return None
-        
-        
-        def validate_connection_string(conn_str):
-            """Validate and format connection string for SQLAlchemy"""
-            if not conn_str:
-                return None
+      displayName: 'Backup Objects with SQLAlchemy'
+      inputs:
+        scriptSource: 'inline'
+        script: |
+          import os
+          import json
+          import sys
+          from datetime import datetime
+          from sqlalchemy import create_engine, text
+          from sqlalchemy.exc import SQLAlchemyError
+          from azure.identity import DefaultAzureCredential
+          from azure.keyvault.secrets import SecretClient
+          import urllib.parse
+          
+          def get_connection_string_from_keyvault():
+              """Retrieve connection string from Azure Key Vault"""
+              try:
+                  keyvault_name = os.getenv("keyVaultName")
+                  secret_name = os.getenv("secretName")
+                  
+                  if not keyvault_name or not secret_name:
+                      print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
+                      print(f"KEYVAULT_NAME: {keyvault_name}")
+                      print(f"SECRET_NAME: {secret_name}")
+                      return None
+                  
+                  print(f"Retrieving connection string from Key Vault: {keyvault_name}, secret: {secret_name}")
+                  
+                  credential = DefaultAzureCredential()
+                  secret_client = SecretClient(
+                      vault_url=f"https://{keyvault_name}.vault.azure.net",
+                      credential=credential
+                  )
+                  
+                  secret = secret_client.get_secret(secret_name)
+                  print(" Successfully retrieved connection string from Key Vault")
+                  print(repr(secret.value))
+                  return secret.value
+                  
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to retrieve connection string from Key Vault: {str(e)}")
+                  return None
+          
+          
+          def validate_connection_string(conn_str):
+              """Validate and format connection string for SQLAlchemy"""
+              if not conn_str:
+                  return None
 
-            # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
-            if conn_str.startswith('mssql+pyodbc://'):
-                return conn_str
+              # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
+              if conn_str.startswith('mssql+pyodbc://'):
+                  return conn_str
 
-            # Parse connection string parameters
-            try:
-                params = {}
-                for part in conn_str.split(';'):
-                    if '=' in part:
-                        key, value = part.split('=', 1)
-                        params[key.strip().lower()] = value.strip()
+              # Parse connection string parameters
+              try:
+                  params = {}
+                  for part in conn_str.split(';'):
+                      if '=' in part:
+                          key, value = part.split('=', 1)
+                          params[key.strip().lower()] = value.strip()
 
-                # Extract connection parameters (case-insensitive)
-                server = params.get('data source', params.get('server', ''))
-                database = params.get('initial catalog', params.get('database', ''))
-                username = params.get('user id', params.get('uid', ''))
-                password = params.get('password', params.get('pwd', ''))
-                encrypt = params.get('encrypt', 'false')
-                trust_cert = params.get('trustservercertificate', 'yes')
-                
-                if not server or not database:
-                    print(f"##vso[task.logissue type=error]Missing server or database in connection string")
-                    return None
+                  # Extract connection parameters (case-insensitive)
+                  server = params.get('data source', params.get('server', ''))
+                  database = params.get('initial catalog', params.get('database', ''))
+                  username = params.get('user id', params.get('uid', ''))
+                  password = params.get('password', params.get('pwd', ''))
+                  encrypt = params.get('encrypt', 'false')
+                  trust_cert = params.get('trustservercertificate', 'yes')
+                  
+                  if not server or not database:
+                      print(f"##vso[task.logissue type=error]Missing server or database in connection string")
+                      return None
 
-                # Build SQLAlchemy URL with explicit driver
-                driver = 'ODBC Driver 18 for SQL Server'  # Changed to try 18 first
-                
-                if username and password:
-                    # Using SQL authentication
-                    quoted_password = urllib.parse.quote_plus(password)
-                    quoted_username = urllib.parse.quote_plus(username)
-                    sqlalchemy_url = (
-                        f"mssql+pyodbc://{quoted_username}:{quoted_password}@{server}/{database}"
-                        f"?driver={urllib.parse.quote_plus(driver)}"
-                        f"&Encrypt={encrypt}"
-                        f"&TrustServerCertificate={trust_cert}"
-                    )
-                else:
-                    # Using Windows authentication or managed identity
-                    sqlalchemy_url = (
-                        f"mssql+pyodbc://@{server}/{database}"
-                        f"?driver={urllib.parse.quote_plus(driver)}"
-                        f"&trusted_connection=yes"
-                        f"&Encrypt={encrypt}"
-                        f"&TrustServerCertificate={trust_cert}"
-                    )
+                  # Build SQLAlchemy URL with explicit driver
+                  driver = 'ODBC Driver 18 for SQL Server'  # Changed to try 18 first
+                  
+                  if username and password:
+                      # Using SQL authentication
+                      quoted_password = urllib.parse.quote_plus(password)
+                      quoted_username = urllib.parse.quote_plus(username)
+                      sqlalchemy_url = (
+                          f"mssql+pyodbc://{quoted_username}:{quoted_password}@{server}/{database}"
+                          f"?driver={urllib.parse.quote_plus(driver)}"
+                          f"&Encrypt={encrypt}"
+                          f"&TrustServerCertificate={trust_cert}"
+                      )
+                  else:
+                      # Using Windows authentication or managed identity
+                      sqlalchemy_url = (
+                          f"mssql+pyodbc://@{server}/{database}"
+                          f"?driver={urllib.parse.quote_plus(driver)}"
+                          f"&trusted_connection=yes"
+                          f"&Encrypt={encrypt}"
+                          f"&TrustServerCertificate={trust_cert}"
+                      )
 
-                print("Successfully converted connection string to SQLAlchemy format")
-                print(f"Using driver: {driver}")
-                return sqlalchemy_url
+                  print("Successfully converted connection string to SQLAlchemy format")
+                  print(f"Using driver: {driver}")
+                  return sqlalchemy_url
 
-            except Exception as e:
-                print(f"##vso[task.logissue type=error]Failed to parse connection string: {str(e)}")
-                return None
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to parse connection string: {str(e)}")
+                  return None
 
 
-        def test_connection(engine):
-            """Test database connection"""
-            try:
-                with engine.connect() as conn:
-                    result = conn.execute(text("SELECT 1 as test"))
-                    row = result.fetchone()
-                    if row and row.test == 1:
-                        print("[OK] Database connection test successful")
-                        return True
-                return False
-            except Exception as e:
-                print(f"##vso[task.logissue type=error]Connection test failed: {str(e)}")
-                print("Hint: Ensure ODBC Driver 17 or 18 for SQL Server is installed on the agent")
-                return False
+          def test_connection(engine):
+              """Test database connection"""
+              try:
+                  with engine.connect() as conn:
+                      result = conn.execute(text("SELECT 1 as test"))
+                      row = result.fetchone()
+                      if row and row.test == 1:
+                          print("[OK] Database connection test successful")
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Connection test failed: {str(e)}")
+                  print("Hint: Ensure ODBC Driver 17 or 18 for SQL Server is installed on the agent")
+                  return False
 
-        
-        def backup_database_objects():
-            # Get connection string
-            raw_connection_string = get_connection_string_from_keyvault()
-            if not raw_connection_string:
-                return False
-            
-            # Validate and format for SQLAlchemy
-            connection_string = validate_connection_string(raw_connection_string)
-            if not connection_string:
-                print("##vso[task.logissue type=error]Invalid connection string format")
-                return False
-            
-            print("Connection string formatted for SQLAlchemy")
-            
-            affected_objects_path = os.environ.get('AFFECTED_OBJECTS_PATH')
-            backup_path = os.environ.get('BACKUP_PATH')
-            
-            if not affected_objects_path or not backup_path:
-                print("##vso[task.logissue type=error]Missing required environment variables")
-                print(f"AFFECTED_OBJECTS_PATH: {affected_objects_path}")
-                print(f"BACKUP_PATH: {backup_path}")
-                return False
-            
-            # Read affected objects
-            try:
-                with open(affected_objects_path, 'r') as f:
-                    affected_data = json.load(f)
-            except Exception as e:
-                print(f"##vso[task.logissue type=error]Failed to read affected objects: {str(e)}")
-                return False
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = os.path.join(backup_path, f"backup_{timestamp}.sql")
-            
-            # Create backup directory
-            os.makedirs(backup_path, exist_ok=True)
-            
-            try:
-                # Create engine with additional parameters for Azure SQL
-                engine = create_engine(
-                    connection_string,
-                    pool_pre_ping=True,
-                    connect_args={
-                        'timeout': 30
-                    },
-                    echo=False  # Set to True for debugging SQL statements
-                )
-                
-                # Test connection before proceeding
-                if not test_connection(engine):
-                    print("##vso[task.logissue type=error]Database connection test failed")
-                    return False
-                
-                backup_script = []
-                backup_script.append(f"-- Backup generated at {datetime.now()}")
-                backup_script.append(f"-- Build: {os.environ.get('BUILD_BUILDNUMBER', 'Unknown')}")
-                backup_script.append(f"-- Script: {os.environ.get('SCRIPT_NAME', 'Unknown')}")
-                backup_script.append("")
-                
-                objects_backed_up = 0
-                
-                with engine.connect() as conn:
-                    # Backup procedures, functions, views
-                    scriptable_objects = affected_data.get('scriptableObjects', [])
-                    if scriptable_objects:
-                        print(f"Backing up {len(scriptable_objects)} scriptable object(s)...")
-                        
-                    for obj in scriptable_objects:
-                        schema = obj['schema']
-                        name = obj['name']
-                        obj_type = obj['type']
-                        action = obj['action']
-                        
-                        try:
-                            # Get object definition based on type
-                            if obj_type.upper() in ['PROCEDURE', 'FUNCTION', 'VIEW']:
-                                query = text(f"""
-                                    SELECT definition 
-                                    FROM sys.sql_modules 
-                                    WHERE object_id = OBJECT_ID('[{schema}].[{name}]')
-                                """)
-                                
-                                result = conn.execute(query)
-                                row = result.fetchone()
-                                
-                                if row and row.definition:
-                                    backup_script.append(f"-- {obj_type}: {schema}.{name} (Action: {action})")
-                                    backup_script.append(row.definition)
-                                    backup_script.append("GO")
-                                    backup_script.append("")
-                                    objects_backed_up += 1
-                                    print(f" Backed up {obj_type} {schema}.{name}")
-                                else:
-                                    print(f" Could not find definition for {obj_type} {schema}.{name}")
-                                    
-                        except SQLAlchemyError as e:
-                            print(f" Could not backup {obj_type} {schema}.{name}: {str(e)}")
-                    
-                    # Backup table structures (for ALTER TABLE operations)
-                    table_objects = [obj for obj in affected_data.get('tableObjects', []) if obj['action'] == 'ALTER']
-                    if table_objects:
-                        print(f"Backing up {len(table_objects)} table structure(s)...")
-                        
-                    for table in table_objects:
-                        schema = table['schema']
-                        name = table['name']
-                        
-                        try:
-                            # Get table creation script using INFORMATION_SCHEMA
-                            query = text(f"""
-                                SELECT 
-                                    c.COLUMN_NAME,
-                                    c.DATA_TYPE,
-                                    c.CHARACTER_MAXIMUM_LENGTH,
-                                    c.NUMERIC_PRECISION,
-                                    c.NUMERIC_SCALE,
-                                    c.IS_NULLABLE,
-                                    CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS CONSTRAINT_TYPE
-                                FROM INFORMATION_SCHEMA.COLUMNS c
-                                LEFT JOIN (
-                                    SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
-                                    FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
-                                    JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
-                                        ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
-                                        AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
-                                ) AS pk 
-                                ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
-                                AND c.TABLE_NAME = pk.TABLE_NAME 
-                                AND c.COLUMN_NAME = pk.COLUMN_NAME
-                                WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}'
-                                ORDER BY c.ORDINAL_POSITION
-                            """)
-                            
-                            result = conn.execute(query)
-                            columns = result.fetchall()
-                            
-                            if columns:
-                                backup_script.append(f"-- Table structure: {schema}.{name} (Action: {table['action']})")
-                                backup_script.append(f"CREATE TABLE [{schema}].[{name}] (")
-                                
-                                column_defs = []
-                                for col in columns:
-                                    col_def = f"    [{col.COLUMN_NAME}] {col.DATA_TYPE}"
-                                    
-                                    # Handle data type specifics
-                                    if col.DATA_TYPE in ['varchar', 'nvarchar', 'char', 'nchar'] and col.CHARACTER_MAXIMUM_LENGTH:
-                                        if col.CHARACTER_MAXIMUM_LENGTH == -1:
-                                            col_def += "(MAX)"
-                                        else:
-                                            col_def += f"({col.CHARACTER_MAXIMUM_LENGTH})"
-                                    elif col.DATA_TYPE in ['decimal', 'numeric'] and col.NUMERIC_PRECISION:
-                                        if col.NUMERIC_SCALE:
-                                            col_def += f"({col.NUMERIC_PRECISION},{col.NUMERIC_SCALE})"
-                                        else:
-                                            col_def += f"({col.NUMERIC_PRECISION})"
-                                            
-                                    if col.IS_NULLABLE == 'NO':
-                                        col_def += " NOT NULL"
-                                    if col.CONSTRAINT_TYPE:
-                                        col_def += f" {col.CONSTRAINT_TYPE}"
-                                    column_defs.append(col_def)
-                                
-                                backup_script.append(",\n".join(column_defs))
-                                backup_script.append(");")
-                                backup_script.append("GO")
-                                backup_script.append("")
-                                objects_backed_up += 1
-                                print(f" Backed up table structure for {schema}.{name}")
-                                
-                        except SQLAlchemyError as e:
-                            print(f" Could not backup table structure for {schema}.{name}: {str(e)}")
-                
-                # Write backup script to file
-                if len(backup_script) > 4:  # More than just headers
-                    with open(backup_file, 'w', encoding='utf-8') as f:
-                        f.write('\n'.join(backup_script))
-                    
-                    file_size = os.path.getsize(backup_file)
-                    print(f"✓ Backup completed: {backup_file} ({file_size} bytes)")
-                    print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
-                    print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
-                    print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]{objects_backed_up}")
-                    
-                    return True
-                else:
-                    print("No objects required backup or no definitions found")
-                    # Create a minimal backup file for audit purposes
-                    with open(backup_file, 'w', encoding='utf-8') as f:
-                        f.write('\n'.join(backup_script))
-                        f.write("\n-- No object definitions were found to backup\n")
-                    
-                    print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
-                    print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
-                    print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]0")
-                    return True
-                    
-            except SQLAlchemyError as e:
-                print(f"##vso[task.logissue type=error]Backup failed: {str(e)}")
-                return False
-            except Exception as e:
-                print(f"##vso[task.logissue type=error]Unexpected error during backup: {str(e)}")
-                return False
-        
-        if __name__ == "__main__":
-            success = backup_database_objects()
-            sys.exit(0 if success else 1)
-    env:
-      keyVaultName: $(keyVaultName)
-      secretName: $(secretName)
-      AFFECTED_OBJECTS_PATH: $(Pipeline.Workspace)/sql/affected_objects.json
-      BACKUP_PATH: $(backupPath)
-      SCRIPT_NAME: ${{ parameters.sqlScriptName }}
-      BUILD_BUILDNUMBER: $(Build.BuildNumber)
+          
+          def backup_database_objects():
+              # Get connection string
+              raw_connection_string = get_connection_string_from_keyvault()
+              if not raw_connection_string:
+                  return False
+              
+              # Validate and format for SQLAlchemy
+              connection_string = validate_connection_string(raw_connection_string)
+              if not connection_string:
+                  print("##vso[task.logissue type=error]Invalid connection string format")
+                  return False
+              
+              print("Connection string formatted for SQLAlchemy")
+              
+              affected_objects_path = os.environ.get('AFFECTED_OBJECTS_PATH')
+              backup_path = os.environ.get('BACKUP_PATH')
+              
+              if not affected_objects_path or not backup_path:
+                  print("##vso[task.logissue type=error]Missing required environment variables")
+                  print(f"AFFECTED_OBJECTS_PATH: {affected_objects_path}")
+                  print(f"BACKUP_PATH: {backup_path}")
+                  return False
+              
+              # Read affected objects
+              try:
+                  with open(affected_objects_path, 'r') as f:
+                      affected_data = json.load(f)
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to read affected objects: {str(e)}")
+                  return False
+              
+              timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+              backup_file = os.path.join(backup_path, f"backup_{timestamp}.sql")
+              
+              # Create backup directory
+              os.makedirs(backup_path, exist_ok=True)
+              
+              try:
+                  # Create engine with additional parameters for Azure SQL
+                  engine = create_engine(
+                      connection_string,
+                      pool_pre_ping=True,
+                      connect_args={
+                          'timeout': 30
+                      },
+                      echo=False  # Set to True for debugging SQL statements
+                  )
+                  
+                  # Test connection before proceeding
+                  if not test_connection(engine):
+                      print("##vso[task.logissue type=error]Database connection test failed")
+                      return False
+                  
+                  backup_script = []
+                  backup_script.append(f"-- Backup generated at {datetime.now()}")
+                  backup_script.append(f"-- Build: {os.environ.get('BUILD_BUILDNUMBER', 'Unknown')}")
+                  backup_script.append(f"-- Script: {os.environ.get('SCRIPT_NAME', 'Unknown')}")
+                  backup_script.append("")
+                  
+                  objects_backed_up = 0
+                  
+                  with engine.connect() as conn:
+                      # Backup procedures, functions, views
+                      scriptable_objects = affected_data.get('scriptableObjects', [])
+                      if scriptable_objects:
+                          print(f"Backing up {len(scriptable_objects)} scriptable object(s)...")
+                          
+                      for obj in scriptable_objects:
+                          schema = obj['schema']
+                          name = obj['name']
+                          obj_type = obj['type']
+                          action = obj['action']
+                          
+                          try:
+                              # Get object definition based on type
+                              if obj_type.upper() in ['PROCEDURE', 'FUNCTION', 'VIEW']:
+                                  query = text(f"""
+                                      SELECT definition 
+                                      FROM sys.sql_modules 
+                                      WHERE object_id = OBJECT_ID('[{schema}].[{name}]')
+                                  """)
+                                  
+                                  result = conn.execute(query)
+                                  row = result.fetchone()
+                                  
+                                  if row and row.definition:
+                                      backup_script.append(f"-- {obj_type}: {schema}.{name} (Action: {action})")
+                                      backup_script.append(row.definition)
+                                      backup_script.append("GO")
+                                      backup_script.append("")
+                                      objects_backed_up += 1
+                                      print(f" Backed up {obj_type} {schema}.{name}")
+                                  else:
+                                      print(f" Could not find definition for {obj_type} {schema}.{name}")
+                                      
+                          except SQLAlchemyError as e:
+                              print(f" Could not backup {obj_type} {schema}.{name}: {str(e)}")
+                      
+                      # Backup table structures (for ALTER TABLE operations)
+                      table_objects = [obj for obj in affected_data.get('tableObjects', []) if obj['action'] == 'ALTER']
+                      if table_objects:
+                          print(f"Backing up {len(table_objects)} table structure(s)...")
+                          
+                      for table in table_objects:
+                          schema = table['schema']
+                          name = table['name']
+                          
+                          try:
+                              # Get table creation script using INFORMATION_SCHEMA
+                              query = text(f"""
+                                  SELECT 
+                                      c.COLUMN_NAME,
+                                      c.DATA_TYPE,
+                                      c.CHARACTER_MAXIMUM_LENGTH,
+                                      c.NUMERIC_PRECISION,
+                                      c.NUMERIC_SCALE,
+                                      c.IS_NULLABLE,
+                                      CASE WHEN pk.COLUMN_NAME IS NOT NULL THEN 'PRIMARY KEY' ELSE '' END AS CONSTRAINT_TYPE
+                                  FROM INFORMATION_SCHEMA.COLUMNS c
+                                  LEFT JOIN (
+                                      SELECT ku.TABLE_SCHEMA, ku.TABLE_NAME, ku.COLUMN_NAME
+                                      FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+                                      JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS ku
+                                          ON tc.CONSTRAINT_TYPE = 'PRIMARY KEY' 
+                                          AND tc.CONSTRAINT_NAME = ku.CONSTRAINT_NAME
+                                  ) AS pk 
+                                  ON c.TABLE_SCHEMA = pk.TABLE_SCHEMA 
+                                  AND c.TABLE_NAME = pk.TABLE_NAME 
+                                  AND c.COLUMN_NAME = pk.COLUMN_NAME
+                                  WHERE c.TABLE_SCHEMA = '{schema}' AND c.TABLE_NAME = '{name}'
+                                  ORDER BY c.ORDINAL_POSITION
+                              """)
+                              
+                              result = conn.execute(query)
+                              columns = result.fetchall()
+                              
+                              if columns:
+                                  backup_script.append(f"-- Table structure: {schema}.{name} (Action: {table['action']})")
+                                  backup_script.append(f"CREATE TABLE [{schema}].[{name}] (")
+                                  
+                                  column_defs = []
+                                  for col in columns:
+                                      col_def = f"    [{col.COLUMN_NAME}] {col.DATA_TYPE}"
+                                      
+                                      # Handle data type specifics
+                                      if col.DATA_TYPE in ['varchar', 'nvarchar', 'char', 'nchar'] and col.CHARACTER_MAXIMUM_LENGTH:
+                                          if col.CHARACTER_MAXIMUM_LENGTH == -1:
+                                              col_def += "(MAX)"
+                                          else:
+                                              col_def += f"({col.CHARACTER_MAXIMUM_LENGTH})"
+                                      elif col.DATA_TYPE in ['decimal', 'numeric'] and col.NUMERIC_PRECISION:
+                                          if col.NUMERIC_SCALE:
+                                              col_def += f"({col.NUMERIC_PRECISION},{col.NUMERIC_SCALE})"
+                                          else:
+                                              col_def += f"({col.NUMERIC_PRECISION})"
+                                              
+                                      if col.IS_NULLABLE == 'NO':
+                                          col_def += " NOT NULL"
+                                      if col.CONSTRAINT_TYPE:
+                                          col_def += f" {col.CONSTRAINT_TYPE}"
+                                      column_defs.append(col_def)
+                                  
+                                  backup_script.append(",\n".join(column_defs))
+                                  backup_script.append(");")
+                                  backup_script.append("GO")
+                                  backup_script.append("")
+                                  objects_backed_up += 1
+                                  print(f" Backed up table structure for {schema}.{name}")
+                                  
+                          except SQLAlchemyError as e:
+                              print(f" Could not backup table structure for {schema}.{name}: {str(e)}")
+                  
+                  # Write backup script to file
+                  if len(backup_script) > 4:  # More than just headers
+                      with open(backup_file, 'w', encoding='utf-8') as f:
+                          f.write('\n'.join(backup_script))
+                      
+                      file_size = os.path.getsize(backup_file)
+                      print(f"✓ Backup completed: {backup_file} ({file_size} bytes)")
+                      print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
+                      print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
+                      print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]{objects_backed_up}")
+                      
+                      return True
+                  else:
+                      print("No objects required backup or no definitions found")
+                      # Create a minimal backup file for audit purposes
+                      with open(backup_file, 'w', encoding='utf-8') as f:
+                          f.write('\n'.join(backup_script))
+                          f.write("\n-- No object definitions were found to backup\n")
+                      
+                      print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
+                      print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
+                      print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]0")
+                      return True
+                      
+              except SQLAlchemyError as e:
+                  print(f"##vso[task.logissue type=error]Backup failed: {str(e)}")
+                  return False
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Unexpected error during backup: {str(e)}")
+                  return False
+          
+          if __name__ == "__main__":
+              success = backup_database_objects()
+              sys.exit(0 if success else 1)
+      env:
+        keyVaultName: $(keyVaultName)
+        secretName: $(secretName)
+        AFFECTED_OBJECTS_PATH: $(Pipeline.Workspace)/sql/affected_objects.json
+        BACKUP_PATH: $(backupPath)
+        SCRIPT_NAME: ${{ parameters.sqlScriptName }}
+        BUILD_BUILDNUMBER: $(Build.BuildNumber)
 
 - task: PublishPipelineArtifact@1
   displayName: 'Publish Backup Files'
