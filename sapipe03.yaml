@@ -1052,18 +1052,21 @@ stages:
           from sqlalchemy.exc import SQLAlchemyError
           from azure.identity import DefaultAzureCredential
           from azure.keyvault.secrets import SecretClient
+          import urllib.parse
           
           def get_connection_string_from_keyvault():
               """Retrieve connection string from Azure Key Vault"""
               try:
-                  keyvault_name = os.environ.get('KEYVAULT_NAME')
-                  secret_name = os.environ.get('SECRET_NAME')
+                  keyvault_name = os.getenv("keyVaultName")
+                  secret_name = os.getenv("secretName")
                   
                   if not keyvault_name or not secret_name:
                       print("##vso[task.logissue type=error]Key Vault name or secret name not configured")
                       print(f"KEYVAULT_NAME: {keyvault_name}")
                       print(f"SECRET_NAME: {secret_name}")
                       return None
+                  
+                  print(f"Retrieving connection string from Key Vault: {keyvault_name}, secret: {secret_name}")
                   
                   credential = DefaultAzureCredential()
                   secret_client = SecretClient(
@@ -1072,11 +1075,96 @@ stages:
                   )
                   
                   secret = secret_client.get_secret(secret_name)
+                  print(" Successfully retrieved connection string from Key Vault")
+                  print(repr(secret.value))
                   return secret.value
                   
               except Exception as e:
                   print(f"##vso[task.logissue type=error]Failed to retrieve connection string from Key Vault: {str(e)}")
                   return None
+          
+          
+          def validate_connection_string(conn_str):
+              """Validate and format connection string for SQLAlchemy"""
+              if not conn_str:
+                  return None
+
+              # If it's already a SQLAlchemy URL (starts with mssql+pyodbc://), return as-is
+              if conn_str.startswith('mssql+pyodbc://'):
+                  return conn_str
+
+              # Parse connection string parameters
+              try:
+                  params = {}
+                  for part in conn_str.split(';'):
+                      if '=' in part:
+                          key, value = part.split('=', 1)
+                          params[key.strip().lower()] = value.strip()
+
+                  # Extract connection parameters (case-insensitive)
+                  server = params.get('data source', params.get('server', ''))
+                  database = params.get('initial catalog', params.get('database', ''))
+                  username = params.get('user id', params.get('uid', ''))
+                  password = params.get('password', params.get('pwd', ''))
+                  
+                  # Convert encrypt parameter to yes/no format for ODBC Driver 18
+                  encrypt_raw = params.get('encrypt', 'no').lower()
+                  encrypt = 'yes' if encrypt_raw in ['true', 'yes', '1'] else 'no'
+                  
+                  # For ODBC Driver 18, when Encrypt=no, we need TrustServerCertificate=yes
+                  trust_cert = params.get('trustservercertificate', 'yes')
+                  
+                  if not server or not database:
+                      print(f"##vso[task.logissue type=error]Missing server or database in connection string")
+                      return None
+
+                  # Build SQLAlchemy URL with explicit driver
+                  driver = 'ODBC Driver 18 for SQL Server'
+                  
+                  if username and password:
+                      # Using SQL authentication
+                      quoted_password = urllib.parse.quote_plus(password)
+                      quoted_username = urllib.parse.quote_plus(username)
+                      sqlalchemy_url = (
+                          f"mssql+pyodbc://{quoted_username}:{quoted_password}@{server}/{database}"
+                          f"?driver={urllib.parse.quote_plus(driver)}"
+                          f"&Encrypt={encrypt}"
+                          f"&TrustServerCertificate={trust_cert}"
+                      )
+                  else:
+                      # Using Windows authentication or managed identity
+                      sqlalchemy_url = (
+                          f"mssql+pyodbc://@{server}/{database}"
+                          f"?driver={urllib.parse.quote_plus(driver)}"
+                          f"&trusted_connection=yes"
+                          f"&Encrypt={encrypt}"
+                          f"&TrustServerCertificate={trust_cert}"
+                      )
+
+                  print("Successfully converted connection string to SQLAlchemy format")
+                  print(f"Using driver: {driver}")
+                  return sqlalchemy_url
+
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Failed to parse connection string: {str(e)}")
+                  return None
+
+
+          def test_connection(engine):
+              """Test database connection"""
+              try:
+                  with engine.connect() as conn:
+                      result = conn.execute(text("SELECT 1 as test"))
+                      row = result.fetchone()
+                      if row and row.test == 1:
+                          print("[OK] Database connection test successful")
+                          return True
+                  return False
+              except Exception as e:
+                  print(f"##vso[task.logissue type=error]Connection test failed: {str(e)}")
+                  print("Hint: Ensure ODBC Driver 17 or 18 for SQL Server is installed on the agent")
+                  return False
+          
           
           def log_message(message, log_type="INFO", log_file=None):
               timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -1116,9 +1204,17 @@ stages:
           
           def execute_sql_script():
               # Get connection string
-              connection_string = get_connection_string_from_keyvault()
-              if not connection_string:
+              raw_connection_string = get_connection_string_from_keyvault()
+              if not raw_connection_string:
                   return False
+              
+              # Validate and format for SQLAlchemy
+              connection_string = validate_connection_string(raw_connection_string)
+              if not connection_string:
+                  print("##vso[task.logissue type=error]Invalid connection string format")
+                  return False
+              
+              print("Connection string formatted for SQLAlchemy")
               
               script_path = os.environ.get('SQL_SCRIPT_PATH')
               
@@ -1134,15 +1230,20 @@ stages:
               try:
                   log_message("Starting SQL script execution with SQLAlchemy", log_file=log_file)
                   
-                  # Create engine with connection pooling and timeout settings
+                  # Create engine with additional parameters for Azure SQL
                   engine = create_engine(
                       connection_string,
                       pool_pre_ping=True,
                       connect_args={
-                          'connect_timeout': 30,
-                          'command_timeout': 600  # 10 minutes per command
-                      }
+                          'timeout': 30
+                      },
+                      echo=False  # Set to True for debugging SQL statements
                   )
+                  
+                  # Test connection before proceeding
+                  if not test_connection(engine):
+                      print("##vso[task.logissue type=error]Database connection test failed")
+                      return False
                   
                   # Read SQL script
                   with open(script_path, 'r', encoding='utf-8') as f:
@@ -1226,8 +1327,8 @@ stages:
               success = execute_sql_script()
               sys.exit(0 if success else 1)
       env:
-        KEYVAULT_NAME: $(keyVaultName)
-        SECRET_NAME: $(secretName)
+        keyVaultName: $(keyVaultName)
+        secretName: $(secretName)
         SQL_SCRIPT_PATH: $(sqlScriptPath)
         LOGS_PATH: $(logsPath)
         BUILD_BUILDNUMBER: $(Build.BuildNumber)
