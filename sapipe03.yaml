@@ -877,7 +877,7 @@ stages:
                                       backup_script.append("GO")
                                       backup_script.append("")
                                       objects_backed_up += 1
-                                      print(f"✓ Backed up {obj_type} {schema}.{name}")
+                                      print(f" Backed up {obj_type} {schema}.{name}")
                                   else:
                                       print(f" Could not find definition for {obj_type} {schema}.{name}")
                                       
@@ -953,7 +953,7 @@ stages:
                                   backup_script.append("GO")
                                   backup_script.append("")
                                   objects_backed_up += 1
-                                  print(f"✓ Backed up table structure for {schema}.{name}")
+                                  print(f" Backed up table structure for {schema}.{name}")
                                   
                           except SQLAlchemyError as e:
                               print(f" Could not backup table structure for {schema}.{name}: {str(e)}")
@@ -964,7 +964,7 @@ stages:
                           f.write('\n'.join(backup_script))
                       
                       file_size = os.path.getsize(backup_file)
-                      print(f"✓ Backup completed: {backup_file} ({file_size} bytes)")
+                      print(f" Backup completed: {backup_file} ({file_size} bytes)")
                       print(f"##vso[task.setvariable variable=backupCompleted;isOutput=true]true")
                       print(f"##vso[task.setvariable variable=backupFileName;isOutput=true]backup_{timestamp}.sql")
                       print(f"##vso[task.setvariable variable=objectsBackedUp;isOutput=true]{objects_backed_up}")
