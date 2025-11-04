@@ -1202,6 +1202,13 @@ stages:
               
               return batches
           
+          def is_ddl_statement(sql):
+              """Check if SQL statement is a DDL statement that needs special handling"""
+              sql_upper = sql.strip().upper()
+              ddl_keywords = ['CREATE PROCEDURE', 'ALTER PROCEDURE', 'CREATE FUNCTION', 'ALTER FUNCTION', 
+                              'CREATE VIEW', 'ALTER VIEW', 'CREATE TRIGGER', 'ALTER TRIGGER']
+              return any(sql_upper.startswith(keyword) for keyword in ddl_keywords)
+          
           def execute_sql_script():
               # Get connection string
               raw_connection_string = get_connection_string_from_keyvault()
@@ -1235,9 +1242,11 @@ stages:
                       connection_string,
                       pool_pre_ping=True,
                       connect_args={
-                          'timeout': 30
+                          'timeout': 30,
+                          'autocommit': True
                       },
-                      echo=False  # Set to True for debugging SQL statements
+                      echo=False,
+                      isolation_level="AUTOCOMMIT"
                   )
                   
                   # Test connection before proceeding
@@ -1275,16 +1284,20 @@ stages:
                           try:
                               start_time = time.time()
                               
-                              # Use text() to handle parameterized queries if needed
-                              sql_text = text(batch)
-                              
-                              # Execute the batch
-                              result = connection.execute(sql_text)
-                              
-                              # If it's a SELECT statement, you can process results
-                              if result.returns_rows:
-                                  rows = result.fetchall()
-                                  log_message(f"Query returned {len(rows)} row(s)", log_file=log_file)
+                              # Check if this is a DDL statement that needs special handling
+                              if is_ddl_statement(batch):
+                                  # Use exec_driver_sql for DDL statements (CREATE/ALTER PROCEDURE, etc.)
+                                  connection.exec_driver_sql(batch)
+                                  log_message(f"Executed DDL statement using exec_driver_sql", log_file=log_file)
+                              else:
+                                  # Use text() for regular DML statements
+                                  sql_text = text(batch)
+                                  result = connection.execute(sql_text)
+                                  
+                                  # If it's a SELECT statement, you can process results
+                                  if result.returns_rows:
+                                      rows = result.fetchall()
+                                      log_message(f"Query returned {len(rows)} row(s)", log_file=log_file)
                               
                               duration = time.time() - start_time
                               total_duration += duration
@@ -1292,15 +1305,9 @@ stages:
                               
                               log_message(f"Batch {batch_number} completed in {duration:.2f}s", log_file=log_file)
                               
-                              # Commit after each successful batch
-                              connection.commit()
-                              
                           except SQLAlchemyError as e:
                               log_message(f"Batch {batch_number} failed: {str(e)}", "ERROR", log_file)
                               log_message(f"Failed batch content: {batch}", "ERROR", log_file)
-                              
-                              # Rollback the transaction
-                              connection.rollback()
                               raise
                   
                   log_message(f"SQL script executed successfully", "SUCCESS", log_file)
