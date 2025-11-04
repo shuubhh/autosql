@@ -1214,36 +1214,13 @@ stages:
           def clean_batch_for_ddl(batch):
               """Clean batch to ensure DDL statements can execute properly"""
               lines = []
-              found_ddl = False
-              ddl_keywords = ['CREATE PROCEDURE', 'ALTER PROCEDURE', 'CREATE FUNCTION', 'ALTER FUNCTION', 
-                              'CREATE VIEW', 'ALTER VIEW', 'CREATE TRIGGER', 'ALTER TRIGGER']
-              
               for line in batch.split('\n'):
-                  stripped = line.strip().upper()
-                  
-                  # Check if we've found the DDL statement
-                  if not found_ddl and any(stripped.startswith(keyword) for keyword in ddl_keywords):
-                      found_ddl = True
-                  
-                  # If we haven't found DDL yet, skip everything except SET statements
-                  if not found_ddl:
-                      if stripped.startswith('SET '):
-                          lines.append(line)
-                      # Skip comments, empty lines, and any other statements before DDL
+                  stripped = line.strip()
+                  # Skip comment-only lines
+                  if stripped.startswith('--'):
                       continue
-                  else:
-                      # Once we find DDL, include everything from that point
-                      lines.append(line)
-              
-              cleaned = '\n'.join(lines).strip()
-              
-              # If we need SET statements, add them at the beginning
-              if found_ddl and not any(l.strip().upper().startswith('SET ') for l in lines[:5]):
-                  # Add standard SET statements that are safe for DDL
-                  set_statements = "SET ANSI_NULLS ON\nSET QUOTED_IDENTIFIER ON\n"
-                  cleaned = set_statements + cleaned
-              
-              return cleaned
+                  lines.append(line)
+              return '\n'.join(lines).strip()
           
           def is_ddl_statement(sql):
               """Check if SQL statement is a DDL statement that needs special handling"""
@@ -1285,11 +1262,9 @@ stages:
                       connection_string,
                       pool_pre_ping=True,
                       connect_args={
-                          'timeout': 30,
-                          'autocommit': True
+                          'timeout': 30
                       },
-                      echo=False,
-                      isolation_level="AUTOCOMMIT"
+                      echo=False
                   )
                   
                   # Test connection before proceeding
@@ -1329,15 +1304,23 @@ stages:
                               
                               # Check if this is a DDL statement that needs special handling
                               if is_ddl_statement(batch):
-                                  # Clean the batch to remove comments that might interfere
+                                  # Clean the batch to remove comments
                                   cleaned_batch = clean_batch_for_ddl(batch)
-                                  log_message(f"Executing DDL statement (cleaned)", log_file=log_file)
+                                  log_message(f"Executing DDL statement using sp_executesql", log_file=log_file)
                                   
-                                  # Use raw connection for DDL statements
+                                  # Escape single quotes in the SQL statement
+                                  escaped_sql = cleaned_batch.replace("'", "''")
+                                  
+                                  # Use sp_executesql which properly handles DDL statements
+                                  exec_sql = f"EXEC sp_executesql N'{escaped_sql}'"
+                                  
+                                  # Use raw connection with autocommit
                                   raw_connection = connection.connection
+                                  raw_connection.autocommit = True
                                   cursor = raw_connection.cursor()
-                                  cursor.execute(cleaned_batch)
+                                  cursor.execute(exec_sql)
                                   cursor.close()
+                                  raw_connection.autocommit = False
                               else:
                                   # Use text() for regular DML statements
                                   sql_text = text(batch)
@@ -1347,6 +1330,9 @@ stages:
                                   if result.returns_rows:
                                       rows = result.fetchall()
                                       log_message(f"Query returned {len(rows)} row(s)", log_file=log_file)
+                                  
+                                  # Commit DML statements
+                                  connection.commit()
                               
                               duration = time.time() - start_time
                               total_duration += duration
@@ -1357,6 +1343,7 @@ stages:
                           except SQLAlchemyError as e:
                               log_message(f"Batch {batch_number} failed: {str(e)}", "ERROR", log_file)
                               log_message(f"Failed batch content: {batch}", "ERROR", log_file)
+                              connection.rollback()
                               raise
                           except Exception as e:
                               log_message(f"Batch {batch_number} failed: {str(e)}", "ERROR", log_file)
